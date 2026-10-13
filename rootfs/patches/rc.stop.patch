@@ -1,0 +1,12 @@
+# Stop before a firmware update: no removed files in the cleanup list.
+--- a/usr/etc/rc.d/rc.stop
++++ b/usr/etc/rc.d/rc.stop
+@@ -42,7 +42,5 @@
+                 rm -fr  /var/log/* \
+                 	/tmp/.sessions.tdb \
+-                	/tmp/boot.txt \
+-			/tmp/system.cfg \
+-                        /tmp/ubntconf.log
++			/tmp/system.cfg
+                 dmesg -c > /dev/null
+ 		${FWUPDATE} -m; rc=$?

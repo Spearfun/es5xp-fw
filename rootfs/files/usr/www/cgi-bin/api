@@ -1,0 +1,686 @@
+#!/bin/sh
+# api - CGI of the ES-5XP web interface. busybox httpd: /cgi-bin/api?a=<action>[&...]
+#
+# Reading - GET. Any change - POST only, with header "X-ES5XP: 1" (CSRF guard: a foreign page
+# cannot add a custom header without a CORS preflight, and this CGI never answers one).
+# Config is the vendor /tmp/system.cfg; it is applied the vendor way:
+#   rc.softrestart save  - apply and write to flash;
+#   rc.softrestart test  - apply WITHOUT writing to flash (address/VLAN changes; es5xp-confirm
+#                          writes flash on confirmation or reboots into the saved config).
+# Values are checked against a whitelist (the generator pastes them into shell scripts).
+# Password hashes and ~META~ records never leave this script.
+# Indentation - spaces only; no bash-isms (busybox ash).
+
+CFG=/tmp/system.cfg
+RUN=/var/run/es5xp-web
+LOCK=$RUN/lock
+PEND=$RUN/pending
+CFGST=$RUN/cfgstate    # answer of config-is-default ("default"/"modified"), kept until the config changes
+BBVER=$RUN/bbver       # first line of the busybox banner, once per boot (changes only with the firmware)
+FWF=/tmp/fwupdate.bin
+RCS=/usr/etc/rc.d/rc.softrestart
+RCW=/usr/etc/rc.d/rc.writecfg
+CONFIRM=/bin/es5xp-confirm
+TEST_SEC=300
+SWDEV=switch1          # the front-port switch (board.info: board.mainswconfig=switch1)
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+umask 077
+
+cfg_changed() { : > "$CFGST"; }   # after every write of $CFG: the kept config-is-default answer is stale
+
+# ---------------------------------------------------------------- output
+hdr() {   # $1 status ("" = 200 OK), $2 content type
+    [ -n "$1" ] && printf 'Status: %s\r\n' "$1"
+    printf 'Content-Type: %s\r\nCache-Control: no-store\r\n\r\n' "${2:-text/plain; charset=utf-8}"
+}
+BODY_LEFT=0      # request body bytes not read yet: a refusal drains them first (else the client sees a reset)
+fail() {
+    [ "$BODY_LEFT" -gt 0 ] && head -c "$BODY_LEFT" > /dev/null
+    hdr "$1"; printf '%s\n' "$2"; exit 0
+}
+
+# ---------------------------------------------------------------- request
+A=; MODE=; ON=; FULL=; T=; H=; C=; P=
+set -f
+OIFS=$IFS; IFS='&'
+for kv in $QUERY_STRING; do
+    case "$kv" in
+        a=*) A=${kv#a=} ;;
+        mode=*) MODE=${kv#mode=} ;;
+        on=*) ON=${kv#on=} ;;
+        full=*) FULL=${kv#full=} ;;
+        t=*) T=${kv#t=} ;;
+        h=*) H=${kv#h=} ;;
+        c=*) C=${kv#c=} ;;
+        p=*) P=${kv#p=} ;;
+    esac
+done
+IFS=$OIFS
+set +f
+
+post_only() {
+    [ "$REQUEST_METHOD" = POST ] || fail "405 Method Not Allowed" "POST only"
+    [ "$HTTP_X_ES5XP" = 1 ] || fail "403 Forbidden" "missing X-ES5XP header"
+}
+
+LEN=0
+body_len() {   # $1 = limit, bytes; sets LEN and BODY_LEFT (the caller reads the body, then BODY_LEFT=0)
+    LEN=${CONTENT_LENGTH:-0}
+    case "$LEN" in ''|*[!0-9]*) fail "400 Bad Request" "bad Content-Length" ;; esac
+    [ "$LEN" -gt 0 ] || fail "400 Bad Request" "empty body"
+    BODY_LEFT=$LEN
+    [ "$LEN" -le "$1" ] || fail "413 Payload Too Large" "body $LEN bytes, limit $1"
+}
+body_to() { head -c "$LEN" > "$1"; BODY_LEFT=0; }   # $1 = file
+
+# ---------------------------------------------------------------- state
+TMPS=
+TOOLDIR=
+cleanup() {
+    [ -n "$TMPS" ] && rm -f $TMPS
+    [ -n "$TOOLDIR" ] && rm -rf "$TOOLDIR"
+    [ -n "$LOCKED" ] && rm -rf "$LOCK"
+}
+trap cleanup EXIT
+trap 'exit 1' INT TERM HUP
+
+LOCKED=
+lock() {
+    mkdir -p "$RUN" 2>/dev/null
+    if ! mkdir "$LOCK" 2>/dev/null; then
+        read p < "$LOCK/pid" 2>/dev/null
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+            fail "409 Conflict" "busy: another change is in progress"
+        fi
+        rm -rf "$LOCK"
+        mkdir "$LOCK" 2>/dev/null || fail "409 Conflict" "busy: lock"
+    fi
+    echo $$ > "$LOCK/pid"
+    LOCKED=1
+}
+
+busy() {   # 0 = the vendor apply/save is still running
+    [ -e /tmp/.rc_is_running ] && return 0
+    # a bgnd job is running only while /var/run/<name>.sock exists (the file is there before "bgnd -r"
+    # returns); a file left by a crashed job is told apart by "bgnd -s" (answers "not running"), so ubntbox runs only then
+    [ -e /var/run/save-cfg.sock ] && { bgnd -s save-cfg > /dev/null 2>&1 || return 0; }
+    [ -e /var/run/softrestart.sock ] && { bgnd -s softrestart > /dev/null 2>&1 || return 0; }
+    return 1
+}
+need_idle() {
+    busy && fail "409 Conflict" "busy: the switch is applying a configuration"
+    [ -f "$PEND" ] && fail "409 Conflict" "a trial apply is waiting for confirmation"
+    return 0
+}
+wait_idle() {   # $1 = seconds
+    i=0
+    while busy; do
+        i=$((i + 1)); [ $i -gt "$1" ] && return 1
+        sleep 1
+    done
+    return 0
+}
+uptime_s() { read u r < /proc/uptime; echo "${u%%.*}"; }
+detach() { setsid /bin/sh -c "$1" < /dev/null > /dev/null 2>&1 & }
+
+# ---------------------------------------------------------------- config merge
+# awk: file 1 = changes ("key=value" sets, "-key" deletes), file 2 = config.
+# Every key and value is checked against the rules; then the merged config goes to stdout,
+# cross-key rules are checked last. Any error: line "ERROR: ..." and exit 2 - the output is discarded.
+MERGE_AWK='
+function rule(k) {
+    if (k ~ /^switch\.port\.[1-5]\.name$/) return "name32"
+    if (k ~ /^switch\.port\.[1-5]\.(status|autoneg|duplex|isolation)$/) return "en"
+    if (k ~ /^switch\.port\.[1-5]\.flowctrl\.status$/) return "en"
+    if (k ~ /^switch\.port\.[1-5]\.speed$/) return "speed"
+    if (k ~ /^switch\.port\.[1-5]\.poe$/) return "poe"
+    if (k ~ /^switch\.port\.[1-5]\.mirror\.source$/) return "both"
+    if (k ~ /^switch\.port\.[1-5]\.mirror\.target$/) return "port"
+    if (k ~ /^switch\.port\.[1-5]\.storm_control\.status$/) return "en"
+    if (k ~ /^switch\.port\.[1-5]\.storm_control\.(broadcasts|multicasts|unicasts)\.status$/) return "en"
+    if (k ~ /^switch\.port\.[1-5]\.storm_control\.(broadcasts|multicasts|unicasts)\.limit$/) return "kbps"
+    if (k == "switch.jumboframes" || k == "switch.rstp.status") return "en"
+    if (k == "switch.rstp.version") return "stpver"
+    if (k == "switch.rstp.bridge.priority") return "bprio"
+    if (k == "switch.rstp.bridge.max_age") return "maxage"
+    if (k == "switch.rstp.bridge.forward_delay") return "fdelay"
+    if (k == "switch.rstp.bridge.hello_time") return "hello"
+    if (k ~ /^switch\.rstp\.port\.[1-5]\.(status|edge|auto_edge)$/) return "en"
+    if (k ~ /^switch\.rstp\.port\.[1-5]\.priority$/) return "pprio"
+    if (k ~ /^switch\.rstp\.port\.[1-5]\.path_cost$/) return "pcost"
+    if (k ~ /^switch\.vlan\.[1-9][0-9]*\.id$/) return "vid"
+    if (k ~ /^switch\.vlan\.[1-9][0-9]*\.name$/) return "name32"
+    if (k ~ /^switch\.vlan\.[1-9][0-9]*\.status$/) return "en"
+    if (k ~ /^switch\.vlan\.[1-9][0-9]*\.port\.[1-5]\.mode$/) return "vmode"
+    if (k == "resolv.host.1.name") return "name64"
+    if (k == "dhcpc.status" || k == "route.status" || k == "route.1.status") return "en"
+    if (k == "resolv.nameserver.status") return "en"
+    if (k == "dhcpc.1.devname" || k == "route.1.devname") return "br0"
+    if (k == "dhcpc.1.fallback" || k == "netconf.3.ip" || k == "route.1.gateway") return "ip"
+    if (k == "dhcpc.1.fallback_netmask" || k == "netconf.3.netmask") return "mask"
+    if (k == "route.1.ip") return "zeroip"
+    if (k == "route.1.netmask") return "zero"
+    if (k ~ /^resolv\.nameserver\.[12]\.ip$/) return "ip"
+    if (k ~ /^resolv\.nameserver\.[12]\.status$/) return "en"
+    if (k == "ntpclient.status") return "en"
+    if (k ~ /^ntpclient\.[12]\.server$/) return "host"
+    if (k ~ /^ntpclient\.[12]\.status$/) return "en"
+    if (k == "system.timezone" || k == "system.timezone.name") return "tz"
+    if (k == "sshd.status") return "en"
+    if (k == "sshd.port") return "tcpport"
+    if (k ~ /^sshd\.auth\.key\.[1-8]\.status$/) return "en"
+    if (k ~ /^sshd\.auth\.key\.[1-8]\.type$/) return "sshtype"
+    if (k ~ /^sshd\.auth\.key\.[1-8]\.value$/) return "b64"
+    if (k ~ /^sshd\.auth\.key\.[1-8]\.comment$/) return "comment"
+    if (k == "syslog.status" || k == "syslog.remote.status") return "en"
+    if (k == "syslog.remote.ip") return "ip"
+    if (k == "syslog.remote.port") return "tcpport"
+    if (k == "qos.status") return "en"
+    if (k == "qos.dscp") return "dscpmode"
+    if (k == "qos.dscp.ptp") return "dscp"
+    if (k ~ /^qos\.port\.[1-5]\.trust$/) return "trust"
+    if (k ~ /^qos\.port\.[1-5]\.prio$/) return "prio"
+    if (k ~ /^qos\.port\.[1-5]\.(ptp|flood)$/) return "en"
+    return ""
+}
+function protected(k) {
+    return k ~ /^switch\.vlan\.1\./ || k == "dhcpc.status" || k == "sshd.status" || k == "sshd.port" ||
+           k == "system.timezone" || k == "system.timezone.name" || k == "resolv.host.1.name"
+}
+function isnum(v) { return v ~ /^(0|[1-9][0-9]*)$/ && length(v) <= 10 }
+function inr(v, a, b) { return isnum(v) && v + 0 >= a && v + 0 <= b }
+function isip(v,   n, o, i) {
+    if (v !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) return 0
+    n = split(v, o, ".")
+    for (i = 1; i <= n; i++) if (!inr(o[i], 0, 255)) return 0
+    return 1
+}
+function okval(t, v) {
+    if (v ~ /[^ -~]/) return 0
+    if (t == "en") return v == "enabled" || v == "disabled"
+    if (t == "name32") return v ~ /^[A-Za-z0-9 ._-]+$/ && length(v) <= 32
+    if (t == "name64") return v ~ /^[A-Za-z0-9 ._-]+$/ && length(v) <= 64
+    if (t == "speed") return v == "10" || v == "100" || v == "1000"
+    if (t == "poe") return v == "0" || v == "24"
+    if (t == "both") return v == "both"
+    if (t == "port") return inr(v, 1, 5)
+    if (t == "kbps") return inr(v, 1, 1000000)
+    if (t == "stpver") return v == "stp" || v == "rstp" || v == "mstp"
+    if (t == "bprio") return inr(v, 0, 61440) && v % 4096 == 0
+    if (t == "maxage") return inr(v, 6, 40)
+    if (t == "fdelay") return inr(v, 4, 30)
+    if (t == "hello") return inr(v, 1, 10)
+    if (t == "u16") return inr(v, 0, 65535)
+    if (t == "pprio") return inr(v, 0, 240) && v % 16 == 0
+    if (t == "pcost") return inr(v, 0, 200000000)
+    if (t == "vid") return inr(v, 1, 4094)
+    if (t == "vmode") return v == "untagged" || v == "tagged" || v == "excluded"
+    if (t == "br0") return v == "br0"
+    if (t == "ip") return isip(v)
+    if (t == "mask") return isip(v)
+    if (t == "zeroip") return v == "0.0.0.0"
+    if (t == "zero") return v == "0"
+    if (t == "host") return v ~ /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/ && length(v) <= 253
+    if (t == "tz") return v ~ /^GMT$/ || v ~ /^GMT-([1-9]|1[0-4])$/ || v ~ /^GMT\+([1-9]|1[0-2])$/
+    if (t == "tcpport") return inr(v, 1, 65535)
+    if (t == "sshtype") return v ~ /^(ssh-rsa|ssh-ed25519|ecdsa-sha2-nistp(256|384|521))$/
+    if (t == "b64") return v ~ /^[A-Za-z0-9+\/]+=*$/ && length(v) >= 16 && length(v) <= 8192
+    if (t == "comment") return v ~ /^[A-Za-z0-9 ._@:+-]*$/ && length(v) <= 64
+    if (t == "dscpmode") return v == "standard" || v == "ptp"
+    if (t == "dscp") return inr(v, 0, 63)
+    if (t == "trust") return v == "dot1p" || v == "ip-dscp" || v == "untrusted"
+    if (t == "prio") return inr(v, 0, 7)
+    return 0
+}
+function bad(msg) { print "ERROR: " msg; err = 1; exit 2 }
+BEGIN { err = 0; nadd = 0; nch = 0 }
+FNR == NR {
+    sub(/\r$/, "")
+    if ($0 == "") next
+    if (++nch > 600) bad("too many changes")
+    if (substr($0, 1, 1) == "-") {
+        k = substr($0, 2)
+        if (rule(k) == "") bad("key not allowed: " k)
+        if (protected(k)) bad("key cannot be deleted: " k)
+        del[k] = 1; delete set[k]
+        next
+    }
+    i = index($0, "=")
+    if (i < 2) bad("bad line: " $0)
+    k = substr($0, 1, i - 1); v = substr($0, i + 1)
+    t = rule(k)
+    if (t == "") bad("key not allowed: " k)
+    if (!okval(t, v)) bad("bad value for " k ": " v)
+    if (!(k in set)) order[++nadd] = k
+    set[k] = v; delete del[k]
+    next
+}
+{
+    line = $0; sub(/\r$/, "", line)
+    i = index(line, "=")
+    if (substr(line, 1, 6) == "~META~" || i < 2) { print line; next }
+    k = substr(line, 1, i - 1)
+    if (k in del) next
+    if (k in set) { if (!(k in done)) { print k "=" set[k]; cur[k] = set[k]; done[k] = 1 } ; next }
+    print line; cur[k] = substr(line, i + 1)
+}
+END {
+    if (err) exit 2
+    for (j = 1; j <= nadd; j++) { k = order[j]; if ((k in set) && !(k in done)) { print k "=" set[k]; cur[k] = set[k] } }
+    if (!("users.1.name" in cur)) bad("merged config has no users.1.name")
+    for (k in cur) if (k ~ /^switch\.vlan\.[0-9]+\.id$/) {
+        split(k, a, "."); if (cur[k] != a[3]) bad("VLAN index " a[3] " has id " cur[k])
+    }
+    for (p = 1; p <= 5; p++) {
+        nu = 0; list = ""
+        for (k in cur) if (k ~ /^switch\.vlan\.[0-9]+\.id$/) {
+            split(k, a, "."); v = a[3]
+            if (cur["switch.vlan." v ".status"] == "disabled") continue
+            if (cur["switch.vlan." v ".port." p ".mode"] == "untagged") { nu++; list = list " " v }
+        }
+        if (nu > 1) bad("port " p " is untagged in more than one VLAN:" list)
+    }
+    tgt = ""
+    for (p = 1; p <= 5; p++) {
+        s = cur["switch.port." p ".mirror.source"]; t = cur["switch.port." p ".mirror.target"]
+        if (s == "" && t == "") continue
+        if (s == "" || t == "") bad("port " p ": mirror source and target must be set together")
+        if (t == p) bad("port " p ": cannot mirror to itself")
+        if (tgt != "" && t != tgt) bad("only one mirror target port is allowed")
+        tgt = t
+    }
+    if (tgt != "" && cur["switch.port." tgt ".mirror.source"] != "") bad("mirror target port " tgt " cannot be a source")
+    if (cur["switch.rstp.status"] == "enabled") {   # IEEE 802.1D-2004 17.14 timer relations
+        ma = ("switch.rstp.bridge.max_age" in cur) ? cur["switch.rstp.bridge.max_age"] + 0 : 20
+        fd = ("switch.rstp.bridge.forward_delay" in cur) ? cur["switch.rstp.bridge.forward_delay"] + 0 : 15
+        ht = ("switch.rstp.bridge.hello_time" in cur) ? cur["switch.rstp.bridge.hello_time"] + 0 : 2
+        if (ma > 2 * (fd - 1)) bad("STP: max age " ma " is more than 2 x (forward delay " fd " - 1)")
+        if (ma < 2 * (ht + 1)) bad("STP: max age " ma " is less than 2 x (hello time " ht " + 1)")
+    }
+}'
+
+merge_into() {   # $1 = changes file, $2 = output; on failure prints the error and returns 1
+    awk "$MERGE_AWK" "$1" "$CFG" > "$2" 2>&1 && return 0
+    grep '^ERROR: ' "$2" | tail -n 1 | grep . || echo "ERROR: awk failed"
+    return 1
+}
+
+same_file() { [ "$(md5sum < "$1")" = "$(md5sum < "$2")" ]; }
+
+# ---------------------------------------------------------------- JSON helpers
+# js: $1 as the body of a JSON string, written to stdout. Plain values (the usual case) go out with the
+# shell builtin, no processes; only values with '"', '\' or control characters take sed/tr.
+js() {
+    case "$1" in
+        *[\"\\]*|*[[:cntrl:]]*) printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# ---------------------------------------------------------------- actions
+case "$A" in
+boot)        # page bootstrap: index.html is the same in every build; this answer (never cached, see hdr) names the
+             # build-versioned style.css and app.js, so the browser takes a new firmware's files without Ctrl+R
+    V=; read -r _ V _ < /usr/etc/es5xp-build 2>/dev/null
+    case "$V" in ''|*[!A-Za-z0-9]*) V=0 ;; esac
+    hdr "" "application/javascript; charset=utf-8"
+    printf 'window.ES5XP_BUILD = "%s";\n' "$V"
+    printf 'document.write(%s);\n' "'<link rel=\"stylesheet\" href=\"style.css?v=$V\">'"
+    ;;
+
+info)
+    hdr "" "application/json"
+    read VER < /lib/version 2>/dev/null
+    read BLD < /usr/etc/es5xp-build 2>/dev/null
+    read UPT X < /proc/uptime
+    BOOT=; { read BOOT < /proc/sys/kernel/random/boot_id; } 2>/dev/null   # changes only with a reboot (waitReboot)
+    read L1 L2 L3 X < /proc/loadavg
+    MT=; MA=
+    while read k v u; do
+        case "$k" in MemTotal:) MT=$v ;; MemAvailable:) MA=$v ;; esac
+    done < /proc/meminfo
+    read TZV < /etc/TZ 2>/dev/null
+    NOW=$(date '+%Y-%m-%d %H:%M:%S')
+    B=false; busy && B=true
+    LEFT=
+    if [ -f "$PEND" ]; then
+        read DL < "$PEND"; LEFT=$((DL - $(uptime_s))); [ "$LEFT" -lt 0 ] && LEFT=0
+    fi
+    FWS=; [ -f "$FWF" ] && FWS=$(wc -c < "$FWF")
+    LOC=false; [ -f /tmp/.led-status-loc ] && LOC=true
+    # strings go out piece by piece through js (no command substitution - no extra processes)
+    printf '{"version":"'; js "$VER"; printf '","build":"'; js "$BLD"
+    printf '","uptime":%s,"load":"%s %s %s","mem_total_kb":%s,"mem_avail_kb":%s,"time":"%s","tz":"' \
+        "${UPT%%.*}" "$L1" "$L2" "$L3" "${MT:-null}" "${MA:-null}" "$NOW"
+    js "$TZV"
+    printf '","busy":%s,"pending":%s,"fwfile":%s,"locate":%s,"boot":"%s","user":"' "$B" "${LEFT:-null}" "${FWS:-null}" "$LOC" "$BOOT"
+    js "$REMOTE_USER"; printf '"'
+    if [ "$FULL" = 1 ]; then
+        read MAC < /sys/class/net/br0/address 2>/dev/null
+        IP=$(/bin/ip -4 addr show dev br0 2>/dev/null | awk '$1 == "inet" { print $2; exit }')
+        # config-is-default compares the whole config with the default (10 processes) - only when there is
+        # no kept answer or the config is newer than it ([ -nt ] is a shell builtin); config writes here clear it
+        if [ ! -s "$CFGST" ] || [ "$CFG" -nt "$CFGST" ]; then
+            /bin/config-is-default > "$CFGST.$$" 2>/dev/null; mv -f "$CFGST.$$" "$CFGST"
+        fi
+        DEF=; read -r DEF < "$CFGST" 2>/dev/null
+        NAME=   # value after the first "=" of the first resolv.host.1.name line, read by the shell itself
+        while IFS= read -r ln || [ -n "$ln" ]; do
+            case "$ln" in resolv.host.1.name=*) NAME=${ln#*=}; break ;; esac
+        done < "$CFG"
+        [ -s "$BBVER" ] || { /bin/busybox 2>&1 | head -n 1 > "$BBVER.$$"; mv -f "$BBVER.$$" "$BBVER"; }
+        BB=; read -r BB < "$BBVER" 2>/dev/null
+        printf ',"name":"'; js "$NAME"; printf '","mac":"'; js "$MAC"; printf '","ip":"'; js "$IP"
+        printf '","cfgstate":"'; js "$DEF"; printf '","busybox":"'; js "$BB"; printf '"'
+    fi
+    printf '}\n'
+    ;;
+
+ports)
+    hdr "" "application/json"
+    exec devinfo ports
+    ;;
+
+fdb)
+    hdr "" "application/json"
+    exec devinfo fdb
+    ;;
+
+cfg)
+    hdr ""
+    grep -v -E '^(~META~|users\.[0-9]+\.password)' "$CFG"
+    ;;
+
+gen)
+    hdr ""
+    for f in /etc/sysinit/*.conf /tmp/diff.sh; do
+        case "$f" in */users.conf) continue ;; esac
+        [ -f "$f" ] || continue
+        echo "===== $f"
+        cat "$f"
+    done
+    ;;
+
+qoscheck)
+    hdr ""
+    /bin/es5xp-qos check 2>&1
+    echo "== rc=$?"
+    ;;
+
+log)
+    hdr ""
+    # kernel crash records (ramoops -> pstore) kept across a warm reboot. At boot the vendor's
+    # rc.sysinit.d/02-pstore moves them from /sys/fs/pstore to /var/run/boot (BOOT_FLAG_DIR), so they live in RAM
+    # until the next reboot; pmsg-* there is the vendor's own reboot mark, not a crash record
+    N=0
+    for f in /var/run/boot/dmesg-* /var/run/boot/console-* /sys/fs/pstore/dmesg-* /sys/fs/pstore/console-*; do
+        [ -f "$f" ] || continue
+        N=$((N + 1))
+        echo "===== kernel crash record (pstore): $f, written $(date -r "$f" '+%Y-%m-%d %H:%M:%S' 2>/dev/null) (switch time), last 150 lines"
+        tail -n 150 "$f" 2>&1
+    done
+    if [ $N -gt 0 ]; then
+        echo "===== the record is kept in RAM until the next reboot"
+        echo "===== system log"
+    fi
+    logread 2>&1 | tail -n 400
+    ;;
+
+backup)
+    STAMP=$(date '+%Y%m%d-%H%M')
+    printf 'Content-Type: application/octet-stream\r\nContent-Disposition: attachment; filename="es5xp-%s.cfg"\r\nCache-Control: no-store\r\n\r\n' "$STAMP"
+    /bin/backupcfg encode "$(date +%s)" -f "$CFG"
+    ;;
+
+set)
+    post_only
+    body_len 65536
+    lock
+    need_idle
+    CH=$RUN/changes.$$; NEW=/tmp/.es5xp-web.cfg.$$
+    TMPS="$CH $NEW"
+    body_to "$CH"
+    if ! ERR=$(merge_into "$CH" "$NEW"); then fail "400 Bad Request" "$ERR"; fi
+    if same_file "$NEW" "$CFG"; then hdr ""; echo "OK no changes"; exit 0; fi
+    chmod 644 "$NEW"
+    if [ "$MODE" = test ]; then
+        $CONFIRM start $TEST_SEC
+        mv -f "$NEW" "$CFG"; cfg_changed
+        $RCS test < /dev/null > /dev/null 2>&1
+        hdr ""; echo "OK trial apply, confirm within $TEST_SEC s"
+    else
+        mv -f "$NEW" "$CFG"; cfg_changed
+        $RCS save < /dev/null > /dev/null 2>&1
+        hdr ""; echo "OK saved"
+    fi
+    ;;
+
+confirm)
+    post_only
+    lock
+    [ -f "$PEND" ] || fail "409 Conflict" "nothing is waiting for confirmation"
+    wait_idle 60 || fail "409 Conflict" "busy: still applying"
+    if $CONFIRM confirm > /dev/null 2>&1; then
+        hdr ""; echo "OK confirmed and written to flash"
+    else
+        fail "500 Internal Server Error" "confirm failed"
+    fi
+    ;;
+
+revert)
+    post_only
+    [ -f "$PEND" ] || fail "409 Conflict" "nothing is waiting for confirmation"
+    hdr ""; echo "OK rebooting into the saved configuration"
+    detach "sleep 1; $CONFIRM revert"
+    ;;
+
+passwd)
+    post_only
+    body_len 256
+    lock
+    need_idle
+    PW=$(head -c "$LEN" | tr -d '\r\n'); BODY_LEFT=0
+    case "$PW" in ''|*[!!-~]*) fail "400 Bad Request" "password: 1-63 printable ASCII characters, no spaces" ;; esac
+    [ ${#PW} -le 63 ] || fail "400 Bad Request" "password: at most 63 characters"
+    HASH=$(/bin/busybox httpd -m "$PW")
+    PW=
+    case "$HASH" in '$1$'*'$'*) ;; *) fail "500 Internal Server Error" "hash failed" ;; esac
+    NEW=/tmp/.es5xp-web.cfg.$$; TMPS="$NEW"
+    awk -v h="$HASH" '
+        /^users\.1\.password(Hash)?=/ { next }
+        /^~META~dXNlcnMuMS5wYXNzd29yZ/ { next }
+        { print }
+        END { print "users.1.password=" h }' "$CFG" > "$NEW" || fail "500 Internal Server Error" "edit failed"
+    grep -q '^users\.1\.name=' "$NEW" || fail "500 Internal Server Error" "edit failed"
+    chmod 644 "$NEW"
+    mv -f "$NEW" "$CFG"; cfg_changed
+    $RCS save < /dev/null > /dev/null 2>&1
+    wait_idle 60
+    U=$(awk -F= '$1 == "users.1.name" { print $2; exit }' "$CFG")
+    hdr ""
+    if awk -F: -v u="$U" -v h="$HASH" '$1 == u && $2 == h { f = 1 } END { exit !f }' /etc/passwd; then
+        echo "OK password changed"
+    else
+        echo "OK saved; /etc/passwd not updated yet - reboot to apply"
+    fi
+    ;;
+
+fwup)
+    post_only
+    body_len 8388608
+    lock
+    need_idle
+    rm -f "$FWF"
+    AV=$(df -k /tmp | awk 'NR == 2 { print $4 }')
+    NEED=$(( (LEN + 1023) / 1024 + 512 ))
+    if [ -z "$AV" ] || [ "$AV" -lt "$NEED" ]; then
+        fail "507 Insufficient Storage" "not enough space in /tmp: need $NEED KiB, free ${AV:-?} KiB"
+    fi
+    body_to "$FWF"
+    GOT=$(wc -c < "$FWF")
+    [ "$GOT" -eq "$LEN" ] || { rm -f "$FWF"; fail "400 Bad Request" "upload incomplete: $GOT of $LEN bytes"; }
+    # The vendor web checked family and board itself (udapi-server: "It is not a compatible firmware image");
+    # fwupdate -c checks only the container. Header: "UBNT", then the version string (256 bytes, NUL-padded).
+    MG=$(head -c 4 "$FWF")
+    NV=$(head -c 260 "$FWF" | tail -c 256 | tr '\000' '\n' | head -n 1)   # C string: up to the first NUL
+    CV=; read CV < /lib/version 2>/dev/null
+    [ "$MG" = UBNT ] || { rm -f "$FWF"; fail "422 Unprocessable Entity" "not a firmware image (no UBNT header)"; }
+    case "$NV" in *.v*) ;; *) NV= ;; esac
+    case "$NV" in ''|*[!A-Za-z0-9._+-]*) rm -f "$FWF"; fail "422 Unprocessable Entity" "bad version string in the image header" ;; esac
+    if [ "${NV%%.v*}" != "${CV%%.v*}" ]; then
+        rm -f "$FWF"
+        fail "422 Unprocessable Entity" "not a compatible firmware image: ${NV%%.v*} (this switch: ${CV%%.v*})"
+    fi
+    OUT=$(/sbin/fwupdate -c 2>&1); RC=$?
+    if [ $RC -ne 0 ]; then
+        rm -f "$FWF"
+        fail "422 Unprocessable Entity" "image check failed (rc=$RC)
+$OUT"
+    fi
+    hdr ""; echo "OK image checked, $GOT bytes"
+    echo "Installed: $CV"; echo "In image:  $NV"
+    [ "$NV" = "$CV" ] && echo "Note: this version is already installed"
+    echo "fwupdate -c: ${OUT:-OK}"
+    ;;
+
+fwgo)
+    post_only
+    lock
+    need_idle
+    [ -s "$FWF" ] || fail "409 Conflict" "no checked image in /tmp"
+    hdr ""; echo "OK flashing; the switch reboots by itself"
+    detach "sleep 2; /sbin/fwupdate -m"
+    ;;
+
+fwcancel)
+    post_only
+    rm -f "$FWF"
+    hdr ""; echo "OK image removed"
+    ;;
+
+restore)
+    post_only
+    body_len 65536
+    lock
+    need_idle
+    F=/tmp/.es5xp-restore.$$; RC_=/tmp/.es5xp-restore.cfg.$$; RH=/tmp/.es5xp-restore.hdr.$$
+    TMPS="$F $RC_ $RH"
+    body_to "$F"
+    /bin/backupcfg check "$F" > /dev/null 2>&1 || fail "400 Bad Request" "not a configuration backup of this device type"
+    /bin/backupcfg decode "$F" "$RC_" "$RH" > /dev/null 2>&1 || fail "400 Bad Request" "backup cannot be decoded"
+    grep -q '^users\.1\.name=' "$RC_" && grep -q '^netconf\.' "$RC_" || fail "400 Bad Request" "backup has no users/netconf keys"
+    awk '$0 != "" && index($0, "=") < 2 { b = 1 } END { exit b }' "$RC_" || fail "400 Bad Request" "backup has lines that are not key=value"
+    chmod 644 "$RC_"
+    mv -f "$RC_" "$CFG"; cfg_changed
+    $RCW -f "$CFG" -p /etc wait > /dev/null 2>&1 || fail "500 Internal Server Error" "writing flash failed"
+    hdr ""; echo "OK restored and written to flash; rebooting"
+    detach "sleep 2; /sbin/reboot"
+    ;;
+
+reset)
+    post_only
+    lock
+    need_idle
+    hdr ""; echo "OK factory reset; rebooting"
+    detach "sleep 2; /bin/factory_reset; /sbin/reboot"
+    ;;
+
+reboot)
+    post_only
+    hdr ""; echo "OK rebooting"
+    detach "sleep 2; /sbin/reboot"
+    ;;
+
+locate)
+    post_only
+    case "$ON" in
+        1) /bin/led-locate.sh start > /dev/null 2>&1 ;;
+        0) /bin/led-locate.sh stop > /dev/null 2>&1 ;;
+        *) fail "400 Bad Request" "on=0|1" ;;
+    esac
+    hdr ""; echo "OK"
+    ;;
+
+arp)
+    hdr "" "application/json"
+    awk 'BEGIN { printf "{\"arp\":[" }
+         NR > 1 && $3 != "0x0" && $4 != "00:00:00:00:00:00" {
+             printf "%s{\"ip\":\"%s\",\"mac\":\"%s\",\"flags\":\"%s\",\"dev\":\"%s\"}", (n++ ? "," : ""), $1, $4, $3, $6 }
+         END { printf "]}\n" }' /proc/net/arp
+    ;;
+
+tool)   # ping / traceroute / arping, one at a time; output as is
+    post_only
+    case "$C" in ''|*[!0-9]*) fail "400 Bad Request" "count: 1-10" ;; esac
+    [ "$C" -ge 1 ] && [ "$C" -le 10 ] || fail "400 Bad Request" "count: 1-10"
+    IS_IP=0
+    printf '%s' "$H" | awk -F. 'NF == 4 { for (i = 1; i <= 4; i++) if ($i !~ /^(0|[1-9][0-9]?[0-9]?)$/ || $i + 0 > 255) exit 1; exit 0 } { exit 1 }' && IS_IP=1
+    IS_HOST=0
+    printf '%s' "$H" | grep -q -E '^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$' && IS_HOST=1
+    case "$T" in
+        ping|traceroute) [ $IS_IP = 1 ] || [ $IS_HOST = 1 ] || fail "400 Bad Request" "host: IPv4 address or host name" ;;
+        arping) [ $IS_IP = 1 ] || fail "400 Bad Request" "arping: IPv4 address only" ;;
+        *) fail "400 Bad Request" "tool: ping, traceroute or arping" ;;
+    esac
+    mkdir -p "$RUN"
+    if ! mkdir "$RUN/tool" 2>/dev/null; then   # busy, unless the owner is gone
+        op=; read op < "$RUN/tool/pid" 2>/dev/null
+        { [ -z "$op" ] || kill -0 "$op" 2>/dev/null; } && fail "409 Conflict" "another diagnostic is running"
+        rm -rf "$RUN/tool"; mkdir "$RUN/tool" 2>/dev/null || fail "409 Conflict" "another diagnostic is running"
+    fi
+    TOOLDIR=$RUN/tool; echo $$ > "$TOOLDIR/pid"
+    hdr ""
+    case "$T" in
+        ping) timeout 40 ping -c "$C" -w $((C + 5)) "$H" 2>&1 ;;
+        traceroute) timeout 60 traceroute -n -q 1 -w 2 -m 15 "$H" 2>&1 ;;
+        arping) timeout 20 arping -c "$C" -w $((C + 2)) -I br0 "$H" 2>&1 ;;
+    esac
+    echo "== rc=$?"
+    ;;
+
+linkreset)   # vendor "Reset Port Link" as udapi-server does it (captured on the switch 2026-10-05):
+             # PHY off (swconfig "set link ''"), lanN down, 5 s, PHY on with the port's own mode, lanN up.
+             # "ip link" alone does not touch the PHY on this kernel. PoE off before, back after
+             # (/bin/poe itself refuses to switch PoE on while the link is already up).
+    post_only
+    case "$P" in [1-5]) ;; *) fail "400 Bad Request" "port: 1-5" ;; esac
+    lock
+    need_idle
+    set -- $(awk -F= -v p="switch.port.$P." '
+        BEGIN { st = "-"; pv = "-"; an = "-"; sp = "-"; du = "-" }
+        index($0, p) == 1 {
+            k = substr($1, length(p) + 1); v = substr($0, length($1) + 2); gsub(/[^A-Za-z0-9]/, "", v); if (v == "") v = "-"
+            if (k == "status") st = v; else if (k == "poe") pv = v; else if (k == "autoneg") an = v
+            else if (k == "speed") sp = v; else if (k == "duplex") du = v
+        }
+        END { print st, pv, an, sp, du }' "$CFG")
+    ST=$1; PV=$2; AN=$3; SP=$4; DU=$5
+    [ "$ST" = disabled ] && fail "409 Conflict" "Unable to reset port $P: it is disabled"
+    case "$PV" in *[!0-9]*) PV=0 ;; esac
+    # the link mode exactly as the generator writes it for this port (switch.conf / diff.sh)
+    if [ "$AN" != disabled ]; then
+        MODE="autoneg on"
+    else
+        [ "$SP" = - ] && SP=100
+        case "$SP" in 10|100|1000) ;; *) fail "500 Internal Server Error" "port $P: unexpected speed '$SP' in the configuration" ;; esac
+        DX=full; [ "$DU" = disabled ] && DX=half
+        if [ "$SP" = 1000 ]; then MODE="speed 1000 duplex full autoneg on"; else MODE="speed $SP duplex $DX autoneg off"; fi
+    fi
+    [ "$PV" != 0 ] && /bin/poe "$P" 0 > /dev/null 2>&1
+    E1=$(swconfig dev "$SWDEV" port "$P" set link '' 2>&1); R1=$?
+    E2=$(/bin/ip link set dev "lan$P" down 2>&1); R2=$?
+    sleep 5
+    E3=$(swconfig dev "$SWDEV" port "$P" set link "$MODE" 2>&1); R3=$?   # always: the PHY must come back
+    E4=$(/bin/ip link set dev "lan$P" up 2>&1); R4=$?
+    [ "$PV" != 0 ] && /bin/poe "$P" "$PV" > /dev/null 2>&1
+    [ "$R1$R2$R3$R4" = 0000 ] || fail "500 Internal Server Error" \
+        "port $P: link off rc=$R1 $E1 / lan$P down rc=$R2 $E2 / link '$MODE' rc=$R3 $E3 / lan$P up rc=$R4 $E4"
+    logger -t es5xp-web "port $P link reset (PHY off 5 s, back as '$MODE')$([ "$PV" != 0 ] && echo ", PoE $PV V")"
+    hdr ""; echo "OK port $P link reset$([ "$PV" != 0 ] && echo ", PoE power cycled")"
+    ;;
+
+*)
+    fail "404 Not Found" "unknown action"
+    ;;
+esac
+exit 0

@@ -1,0 +1,12 @@
+# inittab: start the es5xp web server and the reset button handler.
+--- a/usr/etc/inittab
++++ b/usr/etc/inittab
+@@ -5,4 +5,8 @@
+ # Run daemons
+ ::wait:/usr/etc/rc.d/rc start
++# es5xp: web (busybox httpd, bin/es5xp-web) and the reset button (busybox uevent -> bin/es5xp-button);
++# empty id, not null:: - the generator turns null:: into #ull::
++::respawn:/bin/es5xp-web
++::respawn:/bin/uevent /bin/es5xp-button
+ # Stuff to do before rebooting
+ ::shutdown:/etc/rc.d/rc stop

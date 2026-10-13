@@ -1,0 +1,157 @@
+# System init: IPv6 off, core dumps to /dev/null, persistent hooks, modules with one kmodloader, faster
+# interface renaming, no route cache / broadcast ping lines, ICMP redirects off, one watchdog, ES-5XP only.
+--- a/usr/etc/rc.d/rc.sysinit
++++ b/usr/etc/rc.d/rc.sysinit
+@@ -6,16 +6,26 @@
+ echo "3" > /proc/sys/kernel/panic
+ 
+-if [ -f /etc/presysinit ]; then
+-       	echo #. /etc/persistent/rc.presysinit
++# es5xp: IPv6 off - all (existing interfaces), default (created later: lanN, stp-br, mgmt-port, br0); lo keeps it
++echo 1 > /proc/sys/net/ipv6/conf/default/disable_ipv6
++echo 1 > /proc/sys/net/ipv6/conf/all/disable_ipv6
++echo 0 > /proc/sys/net/ipv6/conf/lo/disable_ipv6
++# es5xp: a core dump of a crashed program goes nowhere; the udapi_bridge plugin used to set this and no longer
++# runs (rc.funcs)
++echo "/dev/null" > /proc/sys/kernel/core_pattern
++
++if [ -f /etc/persistent/hooks/presysinit ]; then
++	. /etc/persistent/hooks/presysinit
+ fi
+ 
+-# create module list, skip ip/eb-tables
++# es5xp: modules of /etc/modules.d with one kmodloader process (the ubox directory loader: one pass over /lib/modules,
++# dependencies from modinfo) instead of rc.modules (sed | ash per group, and modprobe, which scans the module
++# directory on every call, about 0.07 s); with /etc/persistent/no-modules or a blacklist - the old way, rc.modules
+ if [ -d /etc/modules.d/ ]; then
+-
+-modules=`cd /etc/modules.d && ls`
+-
+-# load modules
+-. /usr/etc/rc.d/rc.modules load ${modules}
+-
++	if [ -x /sbin/kmodloader ] && [ ! -e /etc/persistent/no-modules ] && [ ! -s /etc/modules.blacklist ] && [ ! -s /etc/persistent/modules.blacklist ]; then
++		/sbin/kmodloader /etc/modules.d/
++	else
++		modules=`cd /etc/modules.d && ls`
++		. /usr/etc/rc.d/rc.modules load ${modules}
++	fi
+ fi
+ 
+@@ -26,20 +36,21 @@
+ mgmt_iface=""
+ 
+-for iface in /sys/class/net/eth*; do
++# es5xp: the interface of each device from /sys/bus/platform/devices/<device>/net/ (no basename, readlink and
++# echo | grep per interface); renaming, variables and messages as in the vendor script
++for iface in /sys/bus/platform/devices/19000000.eth/net/*; do
+ 	[ -e "$iface" ] || continue
+-	ifname=$(basename $iface)
+-	devpath=$(readlink -f $iface/device 2>/dev/null)
+-	
+-	if echo "$devpath" | grep -q "19000000.eth"; then
+-		# This is the switch interface, should become eth0
+-		ip link set $ifname name tmp_switch 2>/dev/null || true
+-		switch_iface="tmp_switch"
+-		echo "Found switch interface $ifname at 19000000.eth"
+-	elif echo "$devpath" | grep -q "1a000000.eth"; then
+-		# This is the management interface, should become eth1
+-		ip link set $ifname name tmp_mgmt 2>/dev/null || true
+-		mgmt_iface="tmp_mgmt"
+-		echo "Found management interface $ifname at 1a000000.eth"
+-	fi
++	ifname=${iface##*/}
++	# This is the switch interface, should become eth0
++	ip link set $ifname name tmp_switch 2>/dev/null || true
++	switch_iface="tmp_switch"
++	echo "Found switch interface $ifname at 19000000.eth"
++done
++for iface in /sys/bus/platform/devices/1a000000.eth/net/*; do
++	[ -e "$iface" ] || continue
++	ifname=${iface##*/}
++	# This is the management interface, should become eth1
++	ip link set $ifname name tmp_mgmt 2>/dev/null || true
++	mgmt_iface="tmp_mgmt"
++	echo "Found management interface $ifname at 1a000000.eth"
+ done
+ 
+@@ -60,13 +71,13 @@
+ dd if=/dev/mtd5 bs=1 skip=48448 count=16 2>/dev/null | hexdump -e '16/1 "%02x"""' > /etc/deviceid
+ 
+-# set sane defaults for routing tables and conntrack
+-echo "32768" > /proc/sys/net/ipv4/route/max_size
+-echo "2048" > /proc/sys/net/ipv4/route/gc_thresh
+-# end.
++# es5xp: the vendor lines for route/max_size and route/gc_thresh (IPv4 route cache, gone since kernel 3.6) and
++# icmp_echo_ignore_broadcasts=0 (answer broadcast ping, for the removed vendor discovery tools; the kernel default
++# is 1) are removed. ICMP redirects are not accepted: the switch is not a router, and a host without forwarding
++# accepts a redirect if all OR the interface allows it - so zeros in all, default (lanN, stp-br, mgmt-port, br0
++# are created later and take default) and in the existing eth0, eth1, lo
++for f in all default eth0 eth1 lo; do echo 0 > /proc/sys/net/ipv4/conf/$f/accept_redirects; done
+ 
+-# respond to broadcast ping - this is for discovering neighbours IP addresses
+-echo "0" > /proc/sys/net/ipv4/icmp_echo_ignore_broadcasts
+-
+-watchdog_start
++# es5xp: the second watchdog start is removed - /init already started /bin/watchdog -t 1, one watchdog process
++# runs; watchdog_start in rc.funcs stays for rc stop / softrestart
+ 
+ if [ -d /usr/etc/rc.d/rc.sysinit.d ]; then
+@@ -76,41 +87,20 @@
+ fi
+ 
+-if [ -f /etc/postsysinit ]; then
+-       	echo #. /etc/persistent/rc.postsysinit
+-fi
+-
+-if [ -f /proc/device-tree/compatible ]; then
+-	# Load ar8216_vport module for EdgeSwitch 5XP
+-	if strings /proc/device-tree/compatible | grep -q "ubnt,edgeswitch-5xp"; then
+-		if ! grep -q "^ar8216_vport " /proc/modules; then
+-			insmod /lib/modules/*/ar8216_vport.ko 2>&1 | logger -t ar8216-vport
+-			ip link set dev lan1 up
+-			ip link set dev lan2 up
+-			ip link set dev lan3 up
+-			ip link set dev lan4 up
+-			ip link set dev lan5 up
+-			ip link set stp-br up
+-		fi
+-	fi
+-	# Load DSA modules for EdgeSwitch 8XP
+-	if strings /proc/device-tree/compatible | grep -q "ubnt,edgeswitch-8xp"; then
+-		# Load DSA modules
+-		insmod /lib/modules/*/phylink.ko 2>&1 | logger -t dsa
+-		insmod /lib/modules/*/dsa_core.ko 2>&1 | logger -t dsa
+-		insmod /lib/modules/*/tag_brcm.ko 2>&1 | logger -t dsa
+-		insmod /lib/modules/*/b53_common.ko 2>&1 | logger -t dsa
+-		insmod /lib/modules/*/b53_mdio.ko 2>&1 | logger -t dsa
+-
+-		# Wait a moment for modules to initialize
+-		sleep 1
+-
+-		# Bind the bcm53xx driver to the switch
+-		[ -d /sys/bus/mdio_bus/drivers/bcm53xx ] && \
+-			echo "mdio.1:1e" > /sys/bus/mdio_bus/drivers/bcm53xx/bind 2>/dev/null
+-	fi
+-
+-	 insmod /lib/modules/*/switch_link_mirror.ko switch_name=switch0 mirror_port=1 ifname=mgmt-port # To monitor mgmt link state
+-	 ip link set mgmt-port up
++if [ -f /etc/persistent/hooks/postsysinit ]; then
++	. /etc/persistent/hooks/postsysinit
+ fi
+ 
+-dmesg > /tmp/boot.txt
++# es5xp: this firmware is for ES-5XP only - no check of compatible (strings | grep) and /proc/modules; insmod without
++# "| logger" (syslogd is not running yet, the message was lost; an error is now seen on the console); the interfaces
++# go up with one ip -force -batch (an error in one line does not stop the others, as with the separate vendor calls)
++insmod /lib/modules/*/ar8216_vport.ko
++insmod /lib/modules/*/switch_link_mirror.ko switch_name=switch0 mirror_port=1 ifname=mgmt-port # To monitor mgmt link state
++ip -force -batch - <<EOF
++link set dev lan1 up
++link set dev lan2 up
++link set dev lan3 up
++link set dev lan4 up
++link set dev lan5 up
++link set stp-br up
++link set mgmt-port up
++EOF

@@ -1,0 +1,177 @@
+/*
+ * ES-5XP web. Palette and elements: warm light-grey instrument background, panels only slightly
+ * lighter, thin rules, no shadows, 8 px radius,
+ * dark blue-green text; colour carries state only. Fonts are the browser's own (no files).
+ * Added for a configuration UI: tabs, form fields, changed/invalid marks, the apply bar.
+ */
+:root{
+  --bg:#eeece8; --panel:#f2f0ec; --field:#f3f1ed; --raised:#f7f6f2;
+  --rule:#c8c8c4; --hair:#d5d4cf;
+  --fg:#17313a; --dim:#39484d; --faint:#657074; --ink:#0e2129;
+  --ok:#3f6b3f; --warn:#8a6d32; --bad:#9a3f3f; --info:#345a70;
+  --mono:ui-monospace,"DejaVu Sans Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --r:8px; --r-sm:6px;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
+     font-size:14px;line-height:1.35}
+.wrap{max-width:1180px;margin:0 auto;padding:22px 18px 90px}
+
+/* ---- header and tabs ------------------------------------------------ */
+header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:14px}
+.logo{width:46px;height:46px;border-radius:var(--r);background:var(--fg);flex:none;
+      display:inline-flex;align-items:center;justify-content:center;
+      font-family:var(--mono);font-weight:600;font-size:22px;color:var(--field)}
+.titles{display:flex;flex-direction:column;gap:2px;min-width:0}
+.brand{font-size:28px;font-weight:600;letter-spacing:1px;line-height:1.1}
+.subtitle{font-size:13px;color:var(--dim);letter-spacing:.3px}
+.hdr-right{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:13px;color:var(--dim)}
+nav{display:flex;flex-wrap:wrap;gap:2px;border-bottom:1px solid var(--rule);margin-bottom:14px}
+nav a{padding:8px 14px;color:var(--dim);text-decoration:none;font-size:14px;
+      border-bottom:2px solid transparent;margin-bottom:-1px}
+nav a:hover{color:var(--fg)}
+nav a.on{color:var(--ink);font-weight:600;border-bottom-color:var(--fg)}
+
+/* ---- status dots ---------------------------------------------------- */
+.dot{width:9px;height:9px;border-radius:50%;background:var(--faint);flex:none;display:inline-block}
+.dot.ok{background:var(--ok);box-shadow:0 0 0 3px rgba(63,107,63,.18)}
+.dot.warn{background:var(--warn);box-shadow:0 0 0 3px rgba(138,109,50,.18)}
+.dot.bad{background:var(--bad);box-shadow:0 0 0 3px rgba(154,63,63,.18)}
+.dot.live{animation:pulse 1.4s ease-out infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(138,109,50,.38)}70%{box-shadow:0 0 0 8px rgba(138,109,50,0)}
+                 100%{box-shadow:0 0 0 0 rgba(138,109,50,0)}}
+@media (prefers-reduced-motion:reduce){.dot.live{animation:none}}
+
+/* ---- tiles, cards, rows (as GM) -------------------------------------- */
+.kpis{display:grid;gap:12px;margin-bottom:12px;align-items:stretch;
+      grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+.tile{background:var(--field);border:1px solid var(--rule);border-radius:var(--r);min-width:0}
+.tile.ok{border-color:var(--ok)} .tile.warn{border-color:var(--warn)} .tile.bad{border-color:var(--bad)}
+.ctl{padding:12px 16px;display:flex;flex-direction:column;justify-content:center;gap:7px;
+     height:100%;font-size:13px;color:var(--dim);overflow:hidden}
+.ctl-row{display:flex;align-items:center;gap:10px;white-space:nowrap}
+.ctl-row.sub{color:var(--faint)}
+.ctl .name{font-size:13px;letter-spacing:.5px}
+.ctl .val{margin-left:auto;color:var(--fg);font-family:var(--mono);font-size:14px}
+.ctl .val.ok{color:var(--ok)} .ctl .val.warn{color:var(--warn)} .ctl .val.bad{color:var(--bad)}
+.grid{display:grid;gap:12px;margin-bottom:12px;align-items:stretch;
+      grid-template-columns:repeat(auto-fit,minmax(400px,1fr))}
+.card{background:var(--panel);border:1px solid var(--rule);border-radius:var(--r);
+      padding:16px 16px 12px;min-width:0}
+.card.wide{grid-column:1/-1}
+/* paired cards (Maintenance): a card is a 4-row subgrid of the page grid - title / top / middle / bottom -
+   so the same rows of two neighbouring cards share their lines; "end" puts a section on the bottom of its row */
+.card.sg{display:grid;grid-template-rows:subgrid;grid-row:span 4;row-gap:0;align-content:start}
+.card.sg > .sec{min-width:0}
+.card.sg > .sec.end{align-self:end}
+.card.sg .field{margin-top:10px}
+.card.sg .btns.first{margin-top:0}
+.card.sg .btns.inputs{margin:0 0 6px}
+.card > h2{display:flex;align-items:baseline;gap:10px;font-size:16px;font-weight:600;
+           letter-spacing:.2px;color:var(--ink);margin:0 0 12px;
+           border-bottom:1px solid var(--rule);padding-bottom:10px}
+.card > h2 .hint{margin-left:auto;color:var(--faint);font-size:13px;font-weight:400}
+.rows{display:grid;grid-template-columns:minmax(140px,auto) 1fr;align-items:center}
+.rows > div{padding:7px 0;border-bottom:1px solid var(--hair);min-width:0}
+.rows > div:nth-last-child(-n+2){border-bottom:none}
+.k{color:var(--dim);font-weight:500;overflow-wrap:anywhere}
+.v{font-family:var(--mono);color:var(--fg);text-align:right;overflow-wrap:anywhere}
+.v.ok,.ok-t{color:var(--ok)} .v.warn,.warn-t{color:var(--warn)} .v.bad,.bad-t{color:var(--bad)}
+.sects{display:grid;gap:14px 28px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));align-items:start}
+.sect > h3{font-size:13px;font-weight:600;color:var(--dim);letter-spacing:.3px;margin:0 0 6px;
+           padding-bottom:6px;border-bottom:1px solid var(--hair)}
+.cols2{display:grid;grid-template-columns:1fr 1fr;column-gap:32px}
+.cols2 > .rows > div:nth-last-child(-n+2){border-bottom:none}
+@media (max-width:760px){.cols2{grid-template-columns:1fr}.cols2 > .rows:first-child > div:nth-last-child(-n+2){border-bottom:1px solid var(--hair)}}
+.rows > .sub{grid-column:1/-1;border-bottom:1px solid var(--rule);font-size:13px;
+             color:var(--faint);padding:14px 0 7px;margin-top:6px}
+.note{color:var(--dim);font-size:13px;margin:8px 0 4px;line-height:1.45}
+.note.warn{color:var(--warn)}
+.muted{color:var(--faint)}
+.num{font-family:var(--mono)}
+
+/* ---- tables ----------------------------------------------------------- */
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-family:var(--mono)}
+.scroll > table{border:1px solid var(--rule);border-radius:var(--r);overflow:hidden;background:var(--field)}
+th{font-family:var(--sans);color:var(--dim);font-weight:500;text-align:right;padding:8px 10px;
+   border-bottom:1px solid var(--rule);font-size:13px;letter-spacing:.3px;white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid var(--hair);text-align:right;white-space:nowrap;font-size:14px}
+th.l,td.l{text-align:left}
+th:first-child,td:first-child{text-align:left;border-right:1px solid var(--hair)}
+tr:last-child td{border-bottom:none}
+table.form td{font-family:var(--sans)}
+td.c,th.c{text-align:center}
+.empty{color:var(--dim);font-size:13px;padding:8px 10px}
+
+/* ---- form fields ------------------------------------------------------ */
+input[type=text],input[type=number],input[type=password],select,textarea{
+  font:inherit;color:var(--fg);background:var(--raised);border:1px solid var(--rule);
+  border-radius:var(--r-sm);padding:5px 8px;min-width:0}
+input[type=number],input.mono{font-family:var(--mono)}
+input[type=text]{width:100%}
+input.w6{width:6.5em} input.w8{width:8.5em} input.w10{width:10.5em} input.w14{width:14.5em}
+select{padding:5px 6px}
+textarea{width:100%;font-family:var(--mono);font-size:12px;resize:vertical}
+input[type=checkbox]{accent-color:var(--fg);width:15px;height:15px;vertical-align:middle;margin:0}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--fg);outline-offset:1px}
+label.cb{display:inline-flex;align-items:center;gap:7px;cursor:pointer;white-space:nowrap}
+.changed{border-color:var(--warn)!important;box-shadow:0 0 0 1px var(--warn)}
+label.cb.changed,td.changed{box-shadow:none;border-radius:var(--r-sm);background:rgba(138,109,50,.10)}
+.invalid{border-color:var(--bad)!important;box-shadow:0 0 0 1px var(--bad)}
+.inline{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
+.field{display:flex;flex-direction:column;gap:4px;min-width:0}
+.field.rowstart{grid-column-start:1}
+.field > span{font-size:13px;color:var(--dim)}
+.fields{display:grid;gap:10px 14px;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));margin:6px 0}
+button{font:inherit;font-size:13px;color:var(--fg);background:var(--panel);border:1px solid var(--rule);
+       border-radius:var(--r-sm);padding:6px 14px;cursor:pointer;white-space:nowrap}
+button:hover{border-color:var(--fg)}
+button:focus-visible{outline:2px solid var(--fg);outline-offset:2px}
+button:disabled{color:var(--faint);cursor:default;border-color:var(--hair)}
+button.primary{background:var(--fg);color:var(--field);border-color:var(--fg)}
+button.primary:disabled{background:var(--hair);border-color:var(--hair);color:var(--faint)}
+button.danger{color:var(--bad);border-color:var(--bad)}
+button.small{padding:3px 9px;font-size:12px}
+.btns{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
+pre.out{font-family:var(--mono);font-size:12px;background:var(--field);border:1px solid var(--rule);
+        border-radius:var(--r);padding:10px 12px;margin:8px 0 0;max-height:420px;overflow:auto;
+        white-space:pre-wrap;overflow-wrap:anywhere}
+progress{width:100%;height:10px;accent-color:var(--fg)}
+
+/* ---- VLAN membership -------------------------------------------------- */
+.vm{font-family:var(--mono);font-weight:600;width:30px;height:28px;padding:0;border-radius:var(--r-sm)}
+.vm.U{color:var(--ok);border-color:var(--ok)}
+.vm.T{color:var(--info);border-color:var(--info)}
+.vm.E{color:var(--faint)}
+.vm.conflict{background:rgba(154,63,63,.12);border-color:var(--bad)}
+
+/* ---- banner and apply bar --------------------------------------------- */
+.banner{border:1px solid var(--warn);background:var(--raised);border-radius:var(--r);padding:10px 14px;
+        margin-bottom:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.banner.bad{border-color:var(--bad)} .banner.ok{border-color:var(--ok)}
+.banner .grow{flex:1;min-width:220px}
+.applybar{position:fixed;left:0;right:0;bottom:0;background:var(--panel);border-top:1px solid var(--rule);
+          z-index:40}
+.applybar .in{max-width:1180px;margin:0 auto;padding:10px 18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.applybar .grow{flex:1;min-width:200px;color:var(--dim)}
+.applybar pre.out{flex-basis:100%;max-height:220px}
+[hidden]{display:none!important}
+
+/* ---- hints (as GM) ---------------------------------------------------- */
+.hasHint{cursor:help;border-bottom:1px dotted var(--dim);padding-bottom:1px}
+.hasHint:hover{color:var(--fg);border-bottom-color:var(--fg)}
+.hint-pop{position:fixed;z-index:50;max-width:390px;background:var(--raised);border:1px solid var(--rule);
+          border-radius:var(--r);padding:11px 14px;font-size:12px;line-height:1.5;color:var(--fg);
+          box-shadow:0 4px 14px rgba(23,49,58,.14)}
+.hint-pop b{font-weight:600}
+.hint-pop code{font-family:var(--mono);font-size:11px}
+.hint-pop .close{float:right;margin:-2px -4px 0 8px;color:var(--faint);cursor:pointer;font-family:var(--mono)}
+
+@media (max-width:640px){
+  .brand{font-size:22px}
+  .rows{grid-template-columns:minmax(110px,auto) 1fr}
+  nav a{padding:8px 9px}
+}

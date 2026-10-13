@@ -1,0 +1,72 @@
+# install.txt - what the build adds to or changes in the stock root filesystem, applied in this order
+# after remove.txt.
+#   mv     SRC DST            move a vendor file (DST must not exist)
+#   file   MODE PATH          copy rootfs/files/PATH (replaces a file or symlink of the same name)
+#   dir    MODE PATH          create a directory
+#   link   PATH TARGET        symbolic link (replaces a file or symlink of the same name)
+#   built  MODE PATH NAME     program built from src/ (NAME in the build directory)
+#   patch  PATH               patch of a vendor text file (rootfs/patches/patches.txt)
+#   bytes  PATH               byte edits of a vendor binary (rootfs/ubntbox.bytes)
+#   text   MODE PATH VALUE    one-line file made by the build: VALUE is VERSION or STAMP
+
+# programs built from source
+built 0755 bin/busybox busybox
+built 0755 bin/dropbear dropbear
+built 0755 bin/swbatch swbatch
+
+# busybox applets that the vendor busybox did not have
+link bin/arp busybox
+link bin/arping busybox
+link bin/base64 busybox
+link bin/devmem busybox
+link bin/fuser busybox
+link bin/httpd busybox
+link bin/nmeter busybox
+link bin/ntpd busybox
+link bin/pkill busybox
+link bin/pstree busybox
+link bin/stat busybox
+link bin/timeout busybox
+link bin/uevent busybox
+link bin/watch busybox
+
+# wrappers: garp (vendor-only applet), killall and syslogd (options), mstpctl (vendor client moved)
+mv   bin/mstpctl usr/libexec/mstpctl
+file 0755 bin/mstpctl
+file 0755 bin/garp
+file 0755 bin/killall
+link usr/libexec/killall /bin/busybox
+file 0755 bin/syslogd
+link usr/libexec/syslogd /bin/busybox
+
+# time: busybox ntpd under the vendor program name
+file 0755 bin/ntpclient
+
+# switch priorities
+file 0755 bin/es5xp-qos
+
+# web interface and reset button
+file 0755 bin/es5xp-web
+file 0755 bin/es5xp-button
+file 0755 bin/es5xp-confirm
+file 0644 usr/etc/es5xp-httpd.conf
+file 0644 usr/www/app.js
+file 0644 usr/www/index.html
+file 0644 usr/www/style.css
+dir  0755 usr/www/cgi-bin
+file 0755 usr/www/cgi-bin/api
+
+# vendor files
+patch init
+patch usr/etc/inittab
+patch usr/etc/profile
+patch usr/etc/system.cfg
+patch usr/etc/rc.d/rc.do.softrestart
+patch usr/etc/rc.d/rc.funcs
+patch usr/etc/rc.d/rc.stop
+patch usr/etc/rc.d/rc.sysinit
+bytes bin/ubntbox
+
+# version and build marker
+text 0644 lib/version VERSION
+text 0644 usr/etc/es5xp-build STAMP

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ES-5XP</title>
+<!-- index.html is the same in every build; cgi-bin/api?a=boot (never cached) names the build-versioned
+     style.css and app.js, so a new firmware is picked up without a forced reload -->
+<script src="cgi-bin/api?a=boot"></script>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="logo" aria-hidden="true">S</span>
+    <span class="titles">
+      <span class="brand">ES-5XP</span>
+      <span class="subtitle" id="subtitle">EdgeSwitch 5XP</span>
+    </span>
+    <span class="hdr-right"><span class="dot" id="hdrDot"></span><span id="hdrState">&mdash;</span></span>
+  </header>
+  <nav id="nav">
+    <a href="#status">Status</a>
+    <a href="#ports">Ports</a>
+    <a href="#vlan">VLAN</a>
+    <a href="#qos">QoS</a>
+    <a href="#system">System</a>
+    <a href="#tools">Tools</a>
+    <a href="#maint">Maintenance</a>
+  </nav>
+  <div id="banner" class="banner" hidden></div>
+  <main id="page"><div class="note">Loading&hellip;</div></main>
+</div>
+<div id="applybar" class="applybar" hidden>
+  <div class="in">
+    <span class="grow" id="abText"></span>
+    <button type="button" id="abShow">Show</button>
+    <button type="button" id="abDiscard">Discard</button>
+    <button type="button" class="primary" id="abApply">Apply</button>
+    <pre class="out" id="abDiff" hidden></pre>
+  </div>
+</div>
+<script>document.write('<script src="app.js?v=' + (window.ES5XP_BUILD || "0") + '"><\/script>');</script>
+</body>
+</html>

@@ -1,0 +1,155 @@
+# Early boot (/init): empty kernel.hotplug, no grep/debugfs/mdev/usbfs, one mkdir and grouped cp/ln, early
+# /dev/random reader (crng ready sooner), no drop_caches/dirty ratios, no /tmp/ubntconf.log, no crash-report
+# leftovers; BDATE (clock seed at boot) is set by the build.
+--- a/init
++++ b/init
+@@ -4,20 +4,22 @@
+ # crucial mountpoints
+ mount -t proc none /proc
++# es5xp: there is no device event helper (kernel.hotplug = /sbin/hotplug) in the image, but with a non-empty path
++# the kernel tries to start it on every event (modules, interfaces); empty - start nothing
++echo > /proc/sys/kernel/hotplug
+ mount -t sysfs none /sys
+ 
+ # mount /dev in initramfs image
+-grep -q devtmpfs /proc/mounts || mount -t devtmpfs none /dev
++# es5xp: the kernel mounts devtmpfs itself; the test is a shell builtin instead of grep
++# (/dev/kmsg exists only in devtmpfs)
++[ -c /dev/kmsg ] || mount -t devtmpfs none /dev
++# es5xp: an early reader of /dev/random: while it waits, the kernel collects entropy in its context (timer jitter);
++# without it this starts only in cfgmtd -r (RAND_bytes at its end) and cost about 2.3 s of waiting for the crng.
++# nice -n 10: the kernel loop does not take CPU from ubntconf -i and still runs on every timer tick (HZ 100)
++nice -n 10 head -c 1 /dev/random > /dev/null &
+ 
+-if [ -d /sys/kernel/debug ]
+-then
+-	mount -t debugfs none /sys/kernel/debug
+-fi
++# es5xp: debugfs is not mounted, nothing uses it
+ mount -n tmpfs /var -t tmpfs -o size=9437184
+ 
+-if [ -e /usr/etc/mdev.conf ]; then
+-	cp /usr/etc/mdev.conf /var/etc/
+-	echo "/sbin/mdev" > /proc/sys/kernel/hotplug
+-	mdev -s
+-fi
++# es5xp: the mdev and usbfs branches are removed: /usr/etc/mdev.conf and /proc/bus/usb never exist
+ 
+ 
+@@ -31,41 +33,26 @@
+ # rest of the mounts
+ mount none /dev/pts -t devpts
+-if [ -e /proc/bus/usb ]; then
+-	mount none /proc/bus/usb -t usbfs
+-fi
+ echo "...mounts done"
+ 
+-mkdir -p /var/run /var/tmp /var/log /var/etc /var/etc/persistent /var/lock
++# es5xp: all directories with one mkdir (8 calls before, including $BOOT_FLAG_DIR, /etc/sysinit twice, /etc/httpd);
++# /var/crash-data is no longer created
++mkdir -p /var/run /var/tmp /var/log /var/etc /var/etc/persistent /var/lock /var/run/boot /etc/rc.d /etc/init.d /etc/udhcpc /etc/sysinit /etc/httpd
+ echo "...filesystem init done"
+ 
+ # making sure that critical files are in place
+-mkdir -p /etc/rc.d /etc/init.d
++# es5xp: copies and links by lists, one cp or ln per group (about 17 calls before);
++# ppp and mime.types are not in the image
+ # forced update
+-for f in inittab rc.d/rc.sysinit rc.d/rc rc.d/rc.stop ppp; do
+-        [ -e /usr/etc/$f ] && cp -f -r /usr/etc/$f /etc/$f
+-done
++cp -f /usr/etc/inittab /etc/
++cp -f /usr/etc/rc.d/rc.sysinit /usr/etc/rc.d/rc /usr/etc/rc.d/rc.stop /etc/rc.d/
+ echo "...base ok"
+ 
+-mkdir -p /etc/udhcpc
+-# do not update if exist
+-for f in passwd group login.defs profile hosts host.conf \
+-fstab udhcpc/udhcpc startup.list udhcpc_services; do
+-    if [ -e /etc/$f ]; then
+-		echo -n '.'
+-    else
+-        cp -f /usr/etc/$f /etc/$f
+-    fi
+-done
++# do not update if exist (cp -n does not overwrite)
++cp -n /usr/etc/passwd /usr/etc/group /usr/etc/login.defs /usr/etc/profile /usr/etc/hosts /usr/etc/host.conf /usr/etc/fstab /usr/etc/startup.list /usr/etc/udhcpc_services /etc/
++cp -n /usr/etc/udhcpc/udhcpc /etc/udhcpc/
+ echo "...update ok"
+ 
+-mkdir -p /etc/sysinit
+-# make symlinks if do not exist
+-for f in services protocols shells mime.types ethertypes modules.d ssl; do
+-    if [ -e /etc/$f ]; then
+-		echo -n '.'
+-    else
+-        ln -s /usr/etc/$f /etc/$f
+-	fi
+-done
++# make symlinks if do not exist (ln skips existing ones with an error, which is not needed)
++ln -s /usr/etc/services /usr/etc/protocols /usr/etc/shells /usr/etc/ethertypes /usr/etc/modules.d /usr/etc/ssl /etc/ 2>/dev/null
+ echo "...symlinks ok"
+ 
+@@ -76,6 +63,5 @@
+ export BOOT_FLAG_DIR
+ 
+-#Starting watchdog manager
+-mkdir -p $BOOT_FLAG_DIR
++#Starting watchdog manager ($BOOT_FLAG_DIR is created above)
+ /bin/watchdog -t 1 /dev/watchdog && echo "...watchdog ok"
+ 
+@@ -83,10 +69,8 @@
+ if [ -e /sbin/ubntconf ]; then
+ 	/sbin/ubntconf -i $CFG_DEFAULT
+-	echo "ubntconf returned $?" >> /tmp/ubntconf.log
+ 	echo "...detect ok"
+ fi
+ 
+-# System configuration
+-mkdir -p /etc/sysinit/
++# System configuration (/etc/sysinit is created above)
+ /sbin/cfgmtd -r -p /etc/ -f $CFG_RUNNING
+ if [ $? -ne 0 ]; then
+@@ -109,33 +93,25 @@
+ 
+ # Kernel tuning
+-# start the page cache/kmem cache cleanup timer in the kernel
+-echo 1 > /proc/sys/vm/drop_caches
+-# when processes uses page-cache more than 30% of system memory,
+-# lets force them to write
+-echo 20 > /proc/sys/vm/dirty_ratio
+-# when the dirty pages cross more than 5% of sys memory,
+-# kick in the pdflush
+-echo 5 > /proc/sys/vm/dirty_background_ratio
++# es5xp: echo 1 > /proc/sys/vm/drop_caches is removed: dropping the page cache made the second ubntconf
++# unpack busybox, libc, ubntbox and libcrypto from squashfs again - about 5 s of boot time
++# es5xp: the vendor vm.dirty_ratio 20 and vm.dirty_background_ratio 5 are removed - there is no write-back: squashfs is
++# read-only, /tmp and /var are tmpfs, cfgmtd writes the configuration straight to MTD
+ 
+ # Set device date to firmware build date
+-BDATE=202607151150
++BDATE=@BDATE@
+ if [ ! -z $BDATE ]; then
+ 	date -s $BDATE >/dev/null 2>&1
+ fi
+ 
+-mkdir -p /etc/httpd
+-# check if we have uploaded/generated certificates
+-for f in server.crt server.key; do
+-	ln -s /etc/persistent/https/$f /etc/httpd/$f
+-done
++# check if we have uploaded/generated certificates (the httpd plugin needs the links: cat ... > /etc/server.pem)
++ln -s /etc/persistent/https/server.crt /etc/persistent/https/server.key /etc/httpd/
+ echo "...httpd ok"
+ 
+-ulimit -c unlimited
+-mkdir -p /var/crash-data
++# es5xp: ulimit -c unlimited and /var/crash-data are removed - leftovers of the vendor crash reporter (removed);
++# core dumps stay off by the default limit, and core_pattern is /dev/null (rc.sysinit)
+ 
+ # Run configuration parser
+ if [ -e /sbin/ubntconf ]; then
+ 	/sbin/ubntconf
+-	echo "ubntconf returned $?" >> /tmp/ubntconf.log
+ fi
+ 

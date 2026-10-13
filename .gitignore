@@ -1,0 +1,4 @@
+dl/
+out/
+vendor/*
+!vendor/README.md

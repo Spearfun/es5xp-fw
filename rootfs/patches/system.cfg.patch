@@ -1,0 +1,35 @@
+# Factory configuration: management port in the bridge as port 3, IPv6 off, QoS off, SSH on.
+--- a/usr/etc/system.cfg
++++ b/usr/etc/system.cfg
+@@ -1,5 +1,6 @@
+ bridge.1.devname=br0
+ bridge.1.port.1.devname=eth0
+-bridge.1.port.2.devname=eth1
++bridge.1.port.3.devname=eth1
++bridge.1.port.3.status=enabled
+ bridge.status=enabled
+ dhcpc.1.devname=br0
+@@ -13,10 +14,13 @@
+ httpd.status=enabled
+ netconf.1.devname=eth0
++netconf.1.ip6.status=disabled
+ netconf.1.status=enabled
+ netconf.1.up=enabled
+ netconf.2.devname=eth1
++netconf.2.ip6.status=disabled
+ netconf.2.status=enabled
+ netconf.2.up=enabled
+ netconf.3.devname=br0
++netconf.3.ip6.status=disabled
+ netconf.3.role=mlan
+ netconf.3.status=enabled
+@@ -25,7 +29,8 @@
+ netmode=bridge
+ ntpclient.1.server=0.ubnt.pool.ntp.org
++qos.status=disabled
+ route.status=enabled
+ sshd.port=22
+-sshd.status=disabled
++sshd.status=enabled
+ switch.jumboframes=disabled
+ switch.rstp.bridge.forward_delay=4

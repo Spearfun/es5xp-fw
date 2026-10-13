@@ -1,0 +1,8 @@
+#!/bin/sh
+# killall - wrapper (es5xp): -q by default, so that plugin_stop of the ubntbox templates does not print
+# "killall: X: no process killed" for daemons that are not running. The exit code is unchanged.
+# busybox kill.c: -q is taken only as the first argument and only once; -l (list signals) is passed as is.
+case "$1" in
+-q|-l) exec /usr/libexec/killall "$@" ;;
+esac
+exec /usr/libexec/killall -q "$@"

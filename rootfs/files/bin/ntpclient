@@ -1,0 +1,56 @@
+#!/bin/sh
+# /bin/ntpclient (es5xp): time by NTP with the busybox ntpd.
+# The vendor program of this name sent one request per process lifetime and did not set the clock at boot.
+# The name is kept for the vendor generator: inittab line "/sbin/ntpclient ... -h <server 1>",
+# "killall -9 ntpclient" in plugin_stop, "kill -1 1; killall ntpclient" in the difference path when ntpclient.*
+# change. The vendor arguments are not used.
+# Started from inittab: the servers are all ntpclient.N.server of /tmp/system.cfg in ascending N, except disabled
+# ones (ntpclient.N.status=disabled); wait for the first working port 1-5: link, and with bridge STP on also
+# stp_state 4 (read from the ASIC through swbatch, once a second, no time limit); then ntpd -n -S /bin/ntpclient
+# -p S1 -p S2 ... as a child process. SIGTERM/HUP/INT: stop ntpd and exit (init starts it again with the new config).
+# At start an ntpd left over after "killall -9 ntpclient" is stopped (KILL cannot be caught).
+# Called by ntpd (-S): step, stratum, unsync - one syslog line (logger -t ntpd); periodic - nothing.
+up() { cut -d' ' -f1 /proc/uptime; }
+case "$1" in
+    step|stratum|unsync)
+        logger -t ntpd "es5xp: uptime $(up) s: $1, offset ${offset:-?} s, stratum ${stratum:-?}, poll ${poll_interval:-?} s, drift ${freq_drift_ppm:-?} ppm"
+        exit 0 ;;
+    periodic)
+        exit 0 ;;
+esac
+CFG=/tmp/system.cfg
+S=$(awk -F= '
+    $1 ~ /^ntpclient\.[0-9]+\.server$/ && $2 != "" { split($1, k, "."); s[k[2] + 0] = $2 }
+    $1 ~ /^ntpclient\.[0-9]+\.status$/ && $2 == "disabled" { split($1, k, "."); off[k[2] + 0] = 1 }
+    END { for (i = 1; i <= 32; i++) if ((i in s) && !(i in off)) printf "%s ", s[i] }' $CFG 2> /dev/null)
+S=$(echo $S)
+if [ -z "$S" ]; then
+    logger -t ntpd "es5xp: no enabled ntpclient.N.server in $CFG"
+    sleep 3600
+    exit 0
+fi
+grep -q '^switch\.rstp\.status=enabled$' $CFG && STP=1 || STP=0
+logger -t ntpd "es5xp: uptime $(up) s: servers $S; waiting for a switch port with link$([ $STP = 1 ] && echo ' in STP forwarding')"
+c() { printf '%s\037' "$@"; echo; }
+ports() {   # 0 - a port with link (with STP: in forwarding); 1 - none; 2 - swbatch did not answer as expected
+    { for p in 1 2 3 4 5; do c dev switch1 port $p get link; c dev switch1 port $p get stp_state; done; } < /dev/null |
+        swbatch 2> /dev/null | awk -v stp=$STP '
+            NR % 2 == 1 { lnk = ($0 ~ /link:up/) }
+            NR % 2 == 0 { n++; if (lnk && (!stp || $0 == "4")) f = 1 }
+            END { exit (n != 5 ? 2 : !f) }'
+}
+while :; do
+    ports
+    r=$?
+    [ $r = 0 ] && { why="port ready"; break; }
+    [ $r = 2 ] && { why="swbatch did not answer as expected, no port check"; break; }
+    sleep 1
+done
+killall -q ntpd
+P=
+for s in $S; do P="$P -p $s"; done
+logger -t ntpd "es5xp: uptime $(up) s: $why, starting ntpd -n -S /bin/ntpclient$P"
+/bin/ntpd -n -S /bin/ntpclient $P &
+N=$!
+trap 'kill $N 2> /dev/null; wait $N 2> /dev/null; exit 0' TERM HUP INT
+wait $N

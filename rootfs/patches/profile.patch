@@ -1,0 +1,23 @@
+# Login shell profile: ash history in RAM, numeric time zone label for date.
+--- a/usr/etc/profile
++++ b/usr/etc/profile
+@@ -4,4 +4,19 @@
+ export PATH PS1
+ 
++# es5xp: ash history in RAM (/tmp), not in HOME=/etc/persistent (it would be saved to flash with the config)
++HISTFILE=/tmp/.ash_history
++export HISTFILE
++
++# es5xp: time zone label for date in login shells. The vendor writes the zone to /etc/TZ in the POSIX form "GMT-3"
++# (= UTC+3), so date labels local time "GMT"; here the same offset gets a numeric label: GMT-3 -> <+03>-3 ("+03").
++# The config and /etc/TZ are not changed (rollback to stock); daemons and the log stay in UTC
++if [ -r /etc/TZ ] && read -r tz < /etc/TZ; then
++    case "$tz" in
++    GMT-[0-9]|GMT-1[0-4]) h=${tz#GMT-}; [ $h -lt 10 ] && h=0$h; TZ="<+$h>-${tz#GMT-}"; export TZ ;;
++    GMT+[0-9]|GMT+1[0-2]) h=${tz#GMT+}; [ $h -lt 10 ] && h=0$h; TZ="<-$h>+${tz#GMT+}"; export TZ ;;
++    esac
++fi
++unset tz h
++
+ # habits from ubuntu...
+ alias sudo=''

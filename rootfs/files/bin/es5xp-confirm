@@ -1,0 +1,52 @@
+#!/bin/sh
+# es5xp-confirm - trial apply with confirmation (ES-5XP web).
+# The web applies address/VLAN changes with "rc.softrestart test": live, but NOT written to flash.
+#   start SEC  - wait SEC seconds for a confirmation, else reboot (flash still holds the previous
+#                configuration, so the switch comes back with it). Monotonic time: /proc/uptime.
+#   confirm    - write the running /tmp/system.cfg to flash (as ubnt-cli does), stop waiting
+#   revert     - reboot now
+#   left       - seconds left (empty output = nothing is waiting)
+RUN=/var/run/es5xp-web
+PEND=$RUN/pending
+up() { read u r < /proc/uptime; echo "${u%%.*}"; }
+
+case "$1" in
+start)
+    mkdir -p "$RUN"
+    echo $(( $(up) + ${2:-300} )) > "$PEND"
+    setsid /bin/es5xp-confirm timer < /dev/null > /dev/null 2>&1 &
+    ;;
+timer)
+    while [ -f "$PEND" ]; do
+        read dl < "$PEND" 2>/dev/null || exit 0
+        if [ "$(up)" -ge "$dl" ]; then
+            rm -f "$PEND"
+            logger -t es5xp-web "trial apply not confirmed - rebooting into the saved configuration"
+            sync
+            /sbin/reboot
+            exit 0
+        fi
+        sleep 2
+    done
+    ;;
+confirm)
+    [ -f "$PEND" ] || { echo "nothing is waiting for confirmation"; exit 1; }
+    rm -f "$PEND"
+    logger -t es5xp-web "trial apply confirmed - writing to flash"
+    /usr/etc/rc.d/rc.writecfg -f /tmp/system.cfg -p /etc wait
+    ;;
+revert)
+    rm -f "$PEND"
+    logger -t es5xp-web "trial apply reverted - rebooting into the saved configuration"
+    sync
+    /sbin/reboot
+    ;;
+left)
+    [ -f "$PEND" ] && { read dl < "$PEND"; echo $(( dl - $(up) )); }
+    ;;
+*)
+    echo "usage: es5xp-confirm start SEC | confirm | revert | left"
+    exit 1
+    ;;
+esac
+exit 0

@@ -1,0 +1,23 @@
+#!/bin/sh
+# es5xp-web - web interface ES-5XP: busybox httpd under init (line "::respawn:/bin/es5xp-web"
+# in /usr/etc/inittab). Port 8080 (the vendor web used port 80).
+# Authentication: /usr/etc/es5xp-httpd.conf ("/:*:*" - the system user and password, every request).
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+PORT=8080
+SW=switch1
+mkdir -p /var/run/es5xp-web
+rm -rf /var/run/es5xp-web/lock
+# Port counters (Status): the switch driver collects MIB counters only while MIB polling is on, and after
+# boot it is off (ar8xxx_mib_poll_interval=0, ar8xxx_mib_type=0). The vendor's own web server (UDAPI) and
+# devinfo turned it on: 1000 ms, extended. Only values that differ are set: changing the MIB type re-creates the
+# counters, so a respawn of this wrapper must leave running counters alone.
+T=$(swconfig dev "$SW" get ar8xxx_mib_type 2>/dev/null)
+I=$(swconfig dev "$SW" get ar8xxx_mib_poll_interval 2>/dev/null)
+if [ "$T" != 1 ] || [ "$I" != 1000 ]; then
+    [ "$T" = 1 ] || swconfig dev "$SW" set ar8xxx_mib_type 1
+    [ "$I" = 1000 ] || swconfig dev "$SW" set ar8xxx_mib_poll_interval 1000
+    logger -t es5xp-web "MIB polling: type ${T:-?} -> $(swconfig dev "$SW" get ar8xxx_mib_type 2>/dev/null), interval ${I:-?} -> $(swconfig dev "$SW" get ar8xxx_mib_poll_interval 2>/dev/null) ms"
+fi
+/bin/busybox httpd -f -p "$PORT" -h /usr/www -c /usr/etc/es5xp-httpd.conf -r ES-5XP < /dev/null > /dev/null 2>&1
+logger -t es5xp-web "httpd exited (rc=$?), restart in 5 s"
+sleep 5

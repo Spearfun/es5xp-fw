@@ -1,0 +1,58 @@
+# Soft restart: no wifi/country code leftovers and no /tmp/ubntconf.log; qos.* applied after a config save;
+# compare configs with cmp instead of writing an unused diff file.
+--- a/usr/etc/rc.d/rc.do.softrestart
++++ b/usr/etc/rc.d/rc.do.softrestart
+@@ -23,20 +23,12 @@
+ 	rc_stop
+ 
+-	ifconfig wifi0 down
+-
+ 	# extra: restore watchdog functionality
+ 	watchdog_start
+ 
+ 	rm -fr /etc/sysinit/*
+-	rm -fr /etc/ccodes.inc
+-
+-	# kick ubnthal to update board files
+-	CC=`sed -n -e '/radio.1.countrycode=/s/.*\= *//p' $CFG_SYSTEM`
+-	echo $CC > /proc/ubnthal/halupdate
+ 
+ 	# run configuration parser
+ 	if [ -e /sbin/ubntconf ]; then
+ 		/sbin/ubntconf
+-		echo "ubntconf returned $?" >> /tmp/ubntconf.log
+ 	fi
+ 
+@@ -53,8 +45,9 @@
+ 	if [ -e $TEST_LOCK_FILE ]; then
+ 		killall infctld
+-		killall clad >/dev/null 2>&1
+ 		/usr/bin/chmod 644 $TEST_LOCK_FILE
+ 	fi
+ 	/bin/sh /tmp/diff.sh
++	# es5xp: qos.* keys change when the config is saved, and fastrestart does not call rc_start; unchanged keys: skipped
++	setsid /bin/es5xp-qos -l /tmp/es5xp-qos.log apply < /dev/null > /dev/null 2>&1 &
+ }
+ 
+@@ -63,5 +56,4 @@
+ 		/sbin/ubntconf -p $CFG_RUNNING -c $CFG_APPLIED
+ 		fastrestart=$?
+-		echo "ubntconf -p returned $fastrestart" >> /tmp/ubntconf.log
+ 	fi
+ 
+@@ -95,6 +87,7 @@
+ 	sort $CFG_RUNNING | tr -d "\r" > $CFG_RUNNING_SORTED
+ 	sort $CFG_SYSTEM | tr -d "\r" > $CFG_SYSTEM_SORTED
+-	# Single diff: save output and check exit code in one call
+-	diff -U0 $CFG_RUNNING_SORTED $CFG_SYSTEM_SORTED > /tmp/.last_cfg_change.diff
++	# es5xp: compare only (0 equal, 1 different); the vendor wrote the difference to /tmp/.last_cfg_change.diff,
++	# which nothing reads; it is gone, like /tmp/ubntconf.log
++	cmp -s $CFG_RUNNING_SORTED $CFG_SYSTEM_SORTED
+ 	diff_result=$?
+ 	if [ $diff_result -eq 0 ]; then
+@@ -122,5 +115,4 @@
+ 	sort $CFG_RUNNING | tr -d "\r" > $CFG_RUNNING_SORTED
+ 	sort $CFG_SYSTEM | tr -d "\r" > $CFG_SYSTEM_SORTED
+-	diff -U0 $CFG_RUNNING_SORTED $CFG_SYSTEM_SORTED > /tmp/.last_cfg_change.diff
+ 	rm $CFG_SYSTEM_SORTED $CFG_RUNNING_SORTED
+ 	apply_cfg

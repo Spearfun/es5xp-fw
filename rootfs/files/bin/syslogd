@@ -1,0 +1,13 @@
+#!/bin/sh
+# syslogd - wrapper (es5xp): drops -f <file>, adds -C16 (ring buffer for logread).
+# Runs /usr/libexec/syslogd -> /bin/busybox, so that the process is named syslogd (pidof/killall).
+n=$#; i=0
+while [ $i -lt $n ]; do
+    a=$1; shift; i=$((i+1))
+    case "$a" in
+    -f) if [ $i -lt $n ]; then shift; i=$((i+1)); fi; continue ;;
+    -f?*) continue ;;
+    esac
+    set -- "$@" "$a"
+done
+exec /usr/libexec/syslogd -C16 "$@"

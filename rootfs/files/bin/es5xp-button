@@ -1,0 +1,46 @@
+#!/bin/sh
+# es5xp-button - reset button handler (ES-5XP). Started by busybox "uevent" for every
+# kernel uevent: inittab "::respawn:/bin/uevent /bin/es5xp-button".
+#
+# gpio-button-hotplug sends SUBSYSTEM=button BUTTON=reset ACTION=pressed|released SEEN=<s>;
+# on "released" SEEN is the hold time in whole seconds (checked on the switch, T-btn 2026-10-05).
+# Behaviour as documented by the vendor (ES-5XP Quick Start, help.uisp.com):
+#   hold 10 s or more -> the amber MGMT LED (yellow:usr) starts blinking -> release -> factory reset, reboot.
+#   Shorter presses do nothing.
+# A release is acted on only if this handler saw the press: a button held since before the listener
+# started (boot) does not reset anything. The same press is identified by its SEQNUM.
+[ "$SUBSYSTEM" = button ] && [ "$BUTTON" = reset ] || exit 0
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+RUN=/var/run/es5xp-button
+HOLD=10
+LOC=/tmp/.led-status-loc
+
+case "$ACTION" in
+pressed)
+    mkdir -p "$RUN"
+    echo "$SEQNUM" > "$RUN/down"
+    rm -f "$RUN/blink"
+    # at HOLD seconds: blink - "release now to reset" (only if this very press is still held)
+    ( sleep $HOLD
+      [ "$(cat "$RUN/down" 2>/dev/null)" = "$SEQNUM" ] || exit 0
+      : > "$RUN/blink"
+      /bin/sysled-blink 125 ) < /dev/null > /dev/null 2>&1 &
+    ;;
+released)
+    [ -f "$RUN/down" ] || exit 0
+    rm -f "$RUN/down"
+    case "$SEEN" in ''|*[!0-9]*) SEEN=0 ;; esac
+    if [ "$SEEN" -ge $HOLD ]; then
+        logger -t es5xp-button "reset button held $SEEN s - factory reset and reboot"
+        /bin/sysled-blink 125
+        ( /bin/factory_reset; sync; /sbin/reboot ) < /dev/null > /dev/null 2>&1 &
+    else
+        logger -t es5xp-button "reset button held $SEEN s - ignored (hold $HOLD s or more to reset)"
+        if [ -f "$RUN/blink" ]; then   # released just as the blinking started: give the LED back
+            rm -f "$RUN/blink"
+            if [ -f "$LOC" ]; then /bin/sysled-blink 125; else /bin/init-done; fi
+        fi
+    fi
+    ;;
+esac
+exit 0

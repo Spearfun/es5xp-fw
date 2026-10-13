@@ -1,0 +1,23 @@
+#!/bin/sh
+# garp - replacement for the vendor (Ubiquiti) busybox 1.37 applet, es5xp.
+# Same interface as the original: garp [-s n] [-r|-p] [interface]
+#   -s n  wait n seconds before sending; -r request only (arping -U); -p reply only (arping -A)
+#   without an interface - every interface with IPv4 except lo
+s=0; req=1; rep=1
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -s) s=$2; shift 2 ;;
+    -r) rep=0; shift ;;
+    -p) req=0; shift ;;
+    -*) echo "garp: unknown option $1" >&2; exit 1 ;;
+    *)  break ;;
+    esac
+done
+[ "$s" -gt 0 ] 2>/dev/null && sleep "$s"
+/bin/ip -o -4 addr show ${1:+dev "$1"} | while read -r _ ifc _ cidr _; do
+    [ "$ifc" = lo ] && continue
+    a=${cidr%/*}
+    [ $req = 1 ] && /bin/arping -q -U -c 1 -w 1 -I "$ifc" "$a"
+    [ $rep = 1 ] && /bin/arping -q -A -c 1 -w 1 -I "$ifc" "$a"
+done
+exit 0

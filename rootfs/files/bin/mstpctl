@@ -1,0 +1,7 @@
+#!/bin/sh
+# mstpctl - wrapper (es5xp); the mstpd client is /usr/libexec/mstpctl.
+# With STP off mstpd is not running, but plugin_stop of the rstp plugin (ubntbox template) still calls
+# "mstpctl delbridge br0" -> "ctl_client_init: Couldn't connect to server". Nothing to delete -> quiet exit 0.
+# Other commands, and delbridge while mstpd runs, are passed through unchanged.
+if [ "$1" = delbridge ] && ! /bin/pidof mstpd >/dev/null 2>&1; then exit 0; fi
+exec /usr/libexec/mstpctl "$@"

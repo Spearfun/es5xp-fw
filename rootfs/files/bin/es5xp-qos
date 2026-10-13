@@ -1,0 +1,492 @@
+#!/bin/sh
+# es5xp-qos - traffic priorities of the AR8327 switch (Ubiquiti ES-5XP) from the qos.* configuration keys.
+# Part of the es5xp firmware.
+#
+#   es5xp-qos [-c FILE] [-l FILE] [-f] [-t cpu] apply | off | check
+#     apply  - with qos.status=enabled bring the ASIC to the state given by the keys, otherwise act as off.
+#              Skipped as a whole when the qos.* and switch.vlan.* lines have not changed since the last apply
+#              (file /var/run/es5xp-qos.sum); -f - always run.
+#     off    - default state of everything es5xp-qos touches (TOS map = DSCP>>3, PRI_CTRL = 0x18, ING_PORT_CPRI = 0,
+#              flooding to all ports, ACL rules 89-95 removed, PTP ARL entries deleted).
+#     check  - read only: the state expected from the keys against the actual one; exit 0 - equal, 2 - differences.
+#     -c FILE  config instead of /tmp/system.cfg (for tests; the sum file is then removed - the next apply is full)
+#     -t cpu   ACL rules get the action "copy to CPU" instead of the priority (only to test that the rules match)
+#     -l FILE  all output goes to FILE (overwritten), opened after the lock, so parallel runs do not mix it
+#
+# Locking: /var/run/es5xp-qos.lock is the first action in every mode (check also uses the shared reg_addr/reg_val
+# pair of the switch); a lock left by a killed owner is removed. Keys and the sum come from one snapshot of the
+# config taken under the lock.
+#
+# The ASIC is accessed in batches, one process per batch: read everything needed -> compute -> write only what
+# differs (a verification read right after each write) -> parse and check. ACL/ATU busy flag: one register read
+# right after the operation is started; a set bit is a failure. The batch runner is /bin/swbatch; without it, or
+# with the flag file /etc/persistent/es5xp-no-swbatch, the same batch runs line by line through the vendor swconfig.
+# Any failed line of a batch is a failure. A failed write check is reported after the whole write batch.
+#
+# Keys (default when the key is absent):
+#   qos.status            enabled | disabled                   disabled
+#   qos.dscp              standard | ptp                       standard   (ptp: all DSCP -> 0, qos.dscp.ptp -> 7)
+#   qos.dscp.ptp          0..63                                46
+#   qos.port.N.trust      dot1p | ip-dscp | untrusted          dot1p      (N = 1..5)
+#   qos.port.N.prio       0..7                                 0          (priority of untagged frames / of the port when untrusted)
+#   qos.port.N.ptp        enabled | disabled                   disabled   (PTP from the port -> pri 7, PTP multicast to PTP ports only)
+#   qos.port.N.flood      enabled | disabled                   enabled    (unknown unicast/multicast to the port)
+#
+# Registers (AR8327 datasheet; checked on ES-5XP):
+#   TOS_PRI_MAP 0x630-0x64C; PORTn_PRI_CTRL 0x664+0xC*n (EN 18:16, SEL 7:2); PORTn_VLAN_CTRL0 0x420+8*n (ING_PORT_CPRI 31:29);
+#   GLOBAL_FW_CTRL1 0x624 (MULTI_FLOOD_DP 14:8, UNI_FLOOD_DP 6:0); ACL 0x400-0x414, rules 89-95; ATU 0x600-0x60C.
+# Access through the switch attributes (reg_addr decimal, reg_val signed decimal); ACL rules are written with the
+# vendor acl attribute.
+
+VERSION=3
+CFG=/tmp/system.cfg
+TESTCPU=0
+FORCE=0
+SUMF=/var/run/es5xp-qos.sum
+ARLF=/var/run/es5xp-qos.arl
+LOCK=/var/run/es5xp-qos.lock
+LOCKWAIT=60
+LOGF=
+SNAP=/var/run/es5xp-qos.cfg.$$
+TMP=/var/run/es5xp-qos.$$
+SWB=/bin/swbatch
+NOSB=/etc/persistent/es5xp-no-swbatch
+SW=$(sed -n 's/^board\.mainswconfig=//p' /etc/board.info 2>/dev/null); [ -n "$SW" ] || SW=switch1
+PORTS="1 2 3 4 5"
+MAC_L2='01:1b:19:00:00:00'; D0_L2=0x19000000; HI_L2=0x011B
+MAC_UDP='01:00:5e:00:01:81'; D0_UDP=0x5E000181; HI_UDP=0x0100
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -c) CFG=$2; CUSTOM=1; shift 2 ;;
+    -l) LOGF=$2; [ -n "$LOGF" ] || { echo "-l: file required"; exit 1; }; shift 2 ;;
+    -f) FORCE=1; shift ;;
+    -t) [ "$2" = cpu ] || { echo "-t: only cpu"; exit 1; }; TESTCPU=1; shift 2 ;;
+    apply|off|check) MODE=$1; shift ;;
+    *) echo "usage: es5xp-qos [-c FILE] [-l FILE] [-f] [-t cpu] apply|off|check"; exit 1 ;;
+    esac
+done
+[ -n "$MODE" ] || { echo "usage: es5xp-qos [-c FILE] [-l FILE] [-f] [-t cpu] apply|off|check"; exit 1; }
+[ -r "$CFG" ] || { echo "no config $CFG"; exit 1; }
+read -r T0 X < /proc/uptime
+
+# ---------- lock (first action), log, config snapshot ----------
+i=0
+while ! mkdir "$LOCK" 2>/dev/null; do
+    op=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -n "$op" ] && ! kill -0 "$op" 2>/dev/null; then rm -rf "$LOCK"; continue; fi   # owner killed - lock abandoned
+    i=$((i + 1))
+    if [ $i -ge $LOCKWAIT ]; then
+        logger -t es5xp-qos "$MODE not done: busy with another run (pid ${op:-?}) for more than $LOCKWAIT s"
+        echo "ERROR: busy with another run ($LOCK, pid ${op:-?}) for more than $LOCKWAIT s"; exit 1
+    fi
+    sleep 1
+done
+echo $$ > "$LOCK/pid"
+trap 'rm -f "$SNAP"; rm -rf "$TMP" "$LOCK"' EXIT
+trap 'exit 1' INT TERM HUP
+[ -z "$LOGF" ] || exec > "$LOGF" 2>&1
+CFGNAME=$CFG
+cp "$CFG" "$SNAP" 2>/dev/null || { echo "ERROR: cannot copy $CFG"; exit 1; }
+CFG=$SNAP   # from here on everything (keys, VLAN, sum) comes from the snapshot
+mkdir "$TMP" || { echo "ERROR: cannot create $TMP"; exit 1; }
+
+# ---------- ASIC access: batches ----------
+# A batch line holds the swconfig arguments without the program name, each ending with byte 0x1F (swbatch input).
+# Each get line answers with one output line; answers are kept by name: R_<name> u32 decimal, X_<name> 8 hex digits.
+# arl_table (multi-line) only as the last line of a batch; its text goes to the file $TMP/arl.
+NW=0      # number of ASIC writes in this run
+US=$(printf '\037'); IFS0=$IFS
+if [ -x "$SWB" ] && [ ! -e "$NOSB" ]; then SB=1; EXN=swbatch; else SB=0; EXN=swconfig; fi
+fail() { echo "ERROR: $*"; exit 1; }
+bnew() { : > "$TMP/b"; : > "$TMP/n"; NN=0; ARLQ=0; }
+bq()  { printf '%s\037' dev "$SW" "$@" >> "$TMP/b"; echo >> "$TMP/b"; }
+bn()  { echo "$1" >> "$TMP/n"; NN=$((NN + 1)); shift; bq "$@"; }        # $1 answer name, then the get command
+wv()  { [ $(($1)) -ne 0 ] || fail "address 0 is not allowed"; v=$(( $2 & 0xFFFFFFFF )); [ $v -ge 2147483648 ] && v=$((v - 4294967296))
+        bq set reg_addr $(($1)); bq set reg_val $v; }                    # write without counting (starts an ACL read)
+wq()  { wv "$1" "$2"; NW=$((NW + 1)); }                                 # ASIC write
+rd()  { [ $(($2)) -ne 0 ] || fail "address 0 is not allowed"; bq set reg_addr $(($2)); bn "$1" get reg_val; }   # $1 name, $2 address
+brun() {   # run the batch; answers go to variables
+    : > "$TMP/o"; : > "$TMP/e"
+    if [ $SB = 1 ]; then
+        "$SWB" < "$TMP/b" > "$TMP/o" 2> "$TMP/e"; rc=$?
+    else
+        rc=0
+        while IFS= read -r l; do
+            IFS=$US; set -f; set -- $l; set +f; IFS=$IFS0
+            swconfig "$@" >> "$TMP/o" 2>> "$TMP/e" || rc=1
+        done < "$TMP/b"
+    fi
+    [ $rc = 0 ] || fail "batch ($EXN): exit code $rc: $(head -n 3 "$TMP/e" | tr '\n' ' ')"
+    awk -v nn=$NN -v arl=$ARLQ -v af="$TMP/arl" '
+        function u32(x) { x += 0; if (x < 0) x += 4294967296; return x }
+        function hx(x,  h) { h = int(x / 65536); return sprintf("%04x%04x", h, x - h * 65536) }
+        NR == FNR { n[NR] = $0; next }
+        { i++
+          if (i <= nn - arl) {
+              if ($0 !~ /^-?[0-9]+$/) { bad = 1; exit }
+              v = u32($0); if (n[i] ~ /^V?A[0-9]+s[0-9]w5$/) v = v % 256     # ACL rule word 5 has 8 bits
+              printf "R_%s=%.0f X_%s=%s\n", n[i], v, n[i], hx(v)
+          } else print > af }
+        END { if (bad || i < nn) print "BAD=1" }' "$TMP/n" "$TMP/o" > "$TMP/a"
+    BAD=0; . "$TMP/a"
+    [ $BAD = 0 ] || fail "batch ($EXN): number of answers is not the number of requests ($NN)"
+}
+# hex form of computed values: wput <name> <value> ...; wfmt -> Y_<name>
+wput() { echo "$1 $(($2))" >> "$TMP/w"; }
+wfmt() {
+    [ -s "$TMP/w" ] || return 0
+    awk 'function hx(x,  h) { x += 0; if (x < 0) x += 4294967296; h = int(x / 65536); return sprintf("%04x%04x", h, x - h * 65536) }
+         { printf "Y_%s=%s\n", $1, hx($2) }' "$TMP/w" > "$TMP/wa"
+    . "$TMP/wa"; : > "$TMP/w"
+}
+: > "$TMP/w"
+Z5H="00000000 00000000 00000000 00000000 00000000"
+acl_rd() {   # $1 index, $2 part (0 pattern, 1 mask, 2 result), $3 name prefix: start read, busy flag, 5 words
+    wv 0x400 $(( 0x80000400 | ($2 << 8) | $1 ))
+    rd $3B$1s$2 0x400
+    k=1; for a in 0x404 0x408 0x40c 0x410 0x414; do rd $3A$1s$2w$k $a; k=$((k + 1)); done
+}
+acl_got() {  # $1 index, $2 part, $3 prefix -> AG (5 hex words); busy after the start is a failure
+    eval "b=\$R_$3B$1s$2 AG=\"\$X_$3A$1s$2w1 \$X_$3A$1s$2w2 \$X_$3A$1s$2w3 \$X_$3A$1s$2w4 \$X_$3A$1s$2w5\""
+    [ $(( b & 0x80000000 )) -eq 0 ] || fail "ACL_FUNC0 BUSY not cleared"
+}
+acl_wput() { # $1 name, $2..$6 words -> Y_<name>w1..w5
+    an=$1; shift; k=1; for x in "$@"; do wput ${an}w$k $x; k=$((k + 1)); done
+}
+acl_want_h() { eval "AH=\"\$Y_$1w1 \$Y_$1w2 \$Y_$1w3 \$Y_$1w4 \$Y_$1w5\""; }   # $1 name -> AH
+
+# ---------- keys (one awk; the value is everything after the '=' that follows the name) ----------
+eval "$(awk -F= 'index($1, "qos.") == 1 && !($1 in s) { s[$1] = 1; k = $1; v = substr($0, length(k) + 2)
+    gsub(/[.]/, "_", k); if (k !~ /^[A-Za-z0-9_]+$/) next; gsub(/[^A-Za-z0-9._-]/, "?", v); printf "K_%s=%s\n", k, v }' "$CFG")"
+num_in() { case "$1" in ''|*[!0-9]*) return 1 ;; esac; [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]; }
+
+STATUS=$K_qos_status; [ -n "$STATUS" ] || STATUS=disabled
+case "$STATUS" in enabled|disabled) ;; *) fail "qos.status='$STATUS' (enabled|disabled)" ;; esac
+DSCP=$K_qos_dscp; [ -n "$DSCP" ] || DSCP=standard
+case "$DSCP" in standard|ptp) ;; *) fail "qos.dscp='$DSCP' (standard|ptp)" ;; esac
+DPTP=$K_qos_dscp_ptp; [ -n "$DPTP" ] || DPTP=46
+num_in "$DPTP" 0 63 || fail "qos.dscp.ptp='$DPTP' (0..63)"
+PTPMASK=0
+for n in $PORTS; do
+    eval "t=\$K_qos_port_${n}_trust p=\$K_qos_port_${n}_prio q=\$K_qos_port_${n}_ptp f=\$K_qos_port_${n}_flood"
+    [ -n "$t" ] || t=dot1p
+    case "$t" in dot1p|ip-dscp|untrusted) ;; *) fail "qos.port.$n.trust='$t' (dot1p|ip-dscp|untrusted)" ;; esac
+    [ -n "$p" ] || p=0
+    num_in "$p" 0 7 || fail "qos.port.$n.prio='$p' (0..7)"
+    [ -n "$q" ] || q=disabled
+    case "$q" in enabled|disabled) ;; *) fail "qos.port.$n.ptp='$q' (enabled|disabled)" ;; esac
+    [ -n "$f" ] || f=enabled
+    case "$f" in enabled|disabled) ;; *) fail "qos.port.$n.flood='$f' (enabled|disabled)" ;; esac
+    eval "TRUST_$n=$t PRIO_$n=$p PTP_$n=$q FLOOD_$n=$f"
+    [ "$q" = enabled ] && PTPMASK=$(( PTPMASK | (1 << n) ))
+done
+
+# VLAN: lines "VID member-mask(ports 1-5)"; a member is mode untagged|tagged or a trunk port without trunk_excl
+vlans() {
+    awk -F= -v ports="$PORTS" '
+        { v[$1] = substr($0, length($1) + 2) }
+        END {
+            np = split(ports, P, " "); found = 0
+            x = 1; for (j = 0; j <= 7; j++) { BIT[j] = x; x = x * 2 }   # no ^: busybox awk may be built without math
+            for (k in v) if (k ~ /^switch\.vlan\.[0-9]+\.id$/) {
+                split(k, a, "."); i = a[3]
+                if (v["switch.vlan." i ".status"] == "disabled") continue
+                m = 0
+                for (j = 1; j <= np; j++) {
+                    p = P[j]; md = v["switch.vlan." i ".port." p ".mode"]
+                    if (md == "untagged" || md == "tagged") m += BIT[p]
+                    else if (v["switch.port." p ".trunk.status"] == "enabled" && v["switch.vlan." i ".port." p ".trunk_excl"] != "enabled") m += BIT[p]
+                }
+                printf "%d %d\n", v[k], m; found = 1
+            }
+            if (!found) printf "1 %d\n", 62
+        }' "$CFG" | sort -n
+}
+
+# ---------- expected state (result in WV / AW, no subshells) ----------
+if [ "$STATUS" = enabled ] && [ "$MODE" != off ]; then ON=1; else ON=0; fi
+tos_want() {   # $1 = register number 0..7
+    if [ $ON = 1 ] && [ "$DSCP" = ptp ]; then
+        if [ $(( DPTP >> 3 )) -eq $1 ]; then WV=$(( 7 << (4 * (DPTP & 7)) )); else WV=0; fi
+    else WV=$(( 0x11111111 * $1 )); fi
+}
+pri_want() {   # $1 port: value of the fields EN 18:16 + SEL 7:2
+    [ $ON = 1 ] || { WV=$(( 0x18 )); return; }
+    eval t=\$TRUST_$1
+    case $t in dot1p) WV=$(( 0x60018 )) ;; ip-dscp) WV=$(( 0x70024 )) ;; untrusted) WV=$(( 0x40018 )) ;; esac
+}
+cpri_want() { if [ $ON = 1 ]; then eval WV=\$PRIO_$1; else WV=0; fi; }
+flood_want() {  # fields MULTI 14:8 and UNI 6:0
+    m=$(( 0x7F )); if [ $ON = 1 ]; then for fp in $PORTS; do eval f=\$FLOOD_$fp; [ "$f" = disabled ] && m=$(( m & ~(1 << fp) )); done; fi
+    WV=$(( (m << 8) | m ))
+}
+R_PRI7="0 0x1e000000 0 0 0"
+R_CPU="0 0 0x40 0 0"
+acl_want() {    # $1 index 89..95 -> AW = "pattern(5)|mask(5)|result(5)" or empty (no rule wanted)
+    AW=""
+    [ $ON = 1 ] || return 0
+    case $1 in
+    89) [ $PTPMASK -ne 0 ] && AW="0 0 0 0x88f70000 $PTPMASK|0 0 0 0xffff0000 0xc9|$R_PRI7" ;;
+    90) [ $PTPMASK -ne 0 ] && AW="0 0 0x013f0011 0 $PTPMASK|0 0 0x014000ff 0x00010000 0xc2|$R_PRI7" ;;
+    *)  an=$(( $1 - 90 )); eval t=\$TRUST_$an p=\$PRIO_$an
+        [ "$t" = untrusted ] && [ "$p" -gt 0 ] && AW="0 0 0 0 $(( 1 << an ))|0 0 0 0 0xc9|0 $(( 0x10000000 | (p << 25) )) 0 0 0" ;;
+    esac
+    [ -n "$AW" ] && [ $TESTCPU = 1 ] && AW="${AW%|*}|$R_CPU"
+    return 0
+}
+arl_want() {    # lines "VID MAC D0 D1 D2"
+    [ $ON = 1 ] && [ $PTPMASK -ne 0 ] || return 0
+    vlans | while read -r vid mem; do
+        des=$(( mem & PTPMASK )); [ $des -ne 0 ] || continue
+        d2=$(( (vid << 8) | 0xF ))
+        echo "$vid $MAC_L2 $D0_L2 $(( 0x17000000 | (des << 16) | HI_L2 )) $d2"
+        echo "$vid $MAC_UDP $D0_UDP $(( 0x17000000 | (des << 16) | HI_UDP )) $d2"
+    done
+}
+reg_want() {   # $1 name of the read value, $2 field mask, $3 field value -> RW (full expected value)
+    eval c=\$R_$1; RW=$(( (c & ~$2 & 0xFFFFFFFF) | ($3 & $2) ))
+}
+
+# ---------- read everything that is compared or recomputed (one batch) ----------
+read_all() {
+    bnew
+    k=0; while [ $k -le 7 ]; do rd T$k $(( 0x630 + 4 * k )); k=$((k + 1)); done
+    for n in $PORTS; do rd P$n $(( 0x664 + 12 * n )); rd V$n $(( 0x420 + 8 * n )); done
+    rd G 0x624
+    i=89; while [ $i -le 95 ]; do for s in 1 0 2; do acl_rd $i $s ""; done; i=$((i + 1)); done
+    bn IG get igmp_snooping
+    bn ARLT get arl_table; ARLQ=1
+    brun
+}
+want_all() {   # expected register values (from what was read) -> E_<name>, Y_<name>; ACL rules -> Y_N<i>s<part>w<k>
+    k=0; while [ $k -le 7 ]; do tos_want $k; reg_want T$k 0xFFFFFFFF $WV; eval E_T$k=$RW; wput T$k $RW; k=$((k + 1)); done
+    for n in $PORTS; do
+        pri_want $n; reg_want P$n 0x000700FC $WV; eval E_P$n=$RW; wput P$n $RW
+        cpri_want $n; reg_want V$n 0xE0000000 $(( WV << 29 )); eval E_V$n=$RW; wput V$n $RW
+    done
+    flood_want; reg_want G 0x7F7F $WV; E_G=$RW; wput G $RW
+    i=89; while [ $i -le 95 ]; do
+        acl_want $i; eval AW_$i=\"\$AW\"
+        if [ -n "$AW" ]; then
+            IFS='|'; set -- $AW; IFS=$IFS0
+            acl_wput N${i}s0 $1; acl_wput N${i}s1 $2; acl_wput N${i}s2 $3
+        fi
+        i=$((i + 1))
+    done
+    wfmt
+}
+
+up() { read -r t1 x < /proc/uptime; a=${T0%.*}${T0#*.}; b=${t1%.*}${t1#*.}; d=$((b - a)); echo "$((d / 100)).$((d % 100 / 10))"; }
+DIFF=0
+cmp_show() {   # $1 name, $2 actual, $3 expected
+    if [ "$2" = "$3" ]; then echo "  OK    $1: $2"; else echo "  DIFF  $1: is $2, expected $3"; DIFF=$((DIFF + 1)); fi
+}
+
+do_check() {
+    echo "== check ($CFGNAME): qos.status=$STATUS, dscp=$DSCP/$DPTP, PTP ports $(printf '0x%02x' $PTPMASK), ASIC mode: $([ $ON = 1 ] && echo by keys || echo default)"
+    read_all; want_all
+    k=0; while [ $k -le 7 ]; do eval cmp_show "TOS_PRI_MAP$k" \$X_T$k \$Y_T$k; k=$((k + 1)); done
+    for n in $PORTS; do
+        eval cmp_show \"port $n PRI_CTRL\" \$X_P$n \$Y_P$n
+        eval cmp_show \"port $n VLAN_CTRL0\" \$X_V$n \$Y_V$n
+    done
+    cmp_show "GLOBAL_FW_CTRL1" "$X_G" "$Y_G"
+    i=89; while [ $i -le 95 ]; do
+        acl_got $i 1 ""; m=$AG
+        eval w=\"\$AW_$i\"
+        if [ -z "$w" ]; then
+            [ "$m" = "$Z5H" ] && cmp_show "ACL $i" "none" "none" || cmp_show "ACL $i" "mask [$m]" "none"
+        else
+            acl_got $i 0 ""; acl_want_h N${i}s0; cmp_show "ACL $i pattern" "$AG" "$AH"
+            acl_want_h N${i}s1; cmp_show "ACL $i mask" "$m" "$AH"
+            acl_got $i 2 ""; acl_want_h N${i}s2; cmp_show "ACL $i result" "$AG" "$AH"
+        fi
+        i=$((i + 1))
+    done
+    want=$(arl_want)
+    if [ -z "$want" ]; then
+        grep -q -i -e "$MAC_L2" -e "$MAC_UDP" "$TMP/arl" && cmp_show "ARL PTP" "present" "none" || cmp_show "ARL PTP" "none" "none"
+    else
+        while read -r vid mac d0 d1 d2; do
+            w="VID $vid, ports $(printf '0x%02x' $(( (d1 >> 16) & 0x7F )))"
+            grep -q -i "$mac" "$TMP/arl" && cmp_show "ARL $mac" "$w" "$w" || cmp_show "ARL $mac" "not in arl_table" "$w"
+        done <<EOF
+$want
+EOF
+    fi
+    grep -i -e "$MAC_L2" -e "$MAC_UDP" "$TMP/arl" | sed 's/^/        arl_table: /'
+}
+
+do_apply() {
+    echo "== $MODE ($CFGNAME): qos.status=$STATUS, dscp=$DSCP/$DPTP, PTP ports $(printf '0x%02x' $PTPMASK), ASIC mode: $([ $ON = 1 ] && echo by keys || echo default)"
+    read_all; want_all
+    # --- write batch: registers (only those that differ), ACL rules, ARL entries; check reads right after the writes
+    bnew; PLAN=""
+    reg_plan() {   # $1 name, $2 address, $3 label
+        eval "c=\$R_$1 e=\$E_$1"
+        [ $c -eq $e ] && return 0
+        wq $2 $e; rd W$1 $2; PLAN="$PLAN$1 $3
+"
+    }
+    k=0; while [ $k -le 7 ]; do reg_plan T$k $(( 0x630 + 4 * k )) "TOS_PRI_MAP$k"; k=$((k + 1)); done
+    for n in $PORTS; do
+        reg_plan P$n $(( 0x664 + 12 * n )) "port $n PRI_CTRL"
+        reg_plan V$n $(( 0x420 + 8 * n )) "port $n ING_PORT_CPRI"
+    done
+    reg_plan G 0x624 "GLOBAL_FW_CTRL1"
+    acl_set() {    # $1 part, $2 index, $3..$7 words: vendor acl attribute ("F1 F2 F3 F4 F5 F0", hex), then a check read
+        as_sel=$1; as_idx=$2; shift 2
+        bq set acl "$(printf '%x %x %x %x %x %x' $(($1)) $(($2)) $(($3)) $(($4)) $(($5)) $(( 0x80000000 | (as_sel << 8) | as_idx )))"
+        NW=$((NW + 1)); rd SB${as_idx}s$as_sel 0x400
+        acl_rd $as_idx $as_sel V
+    }
+    ACLP=""
+    i=89; while [ $i -le 95 ]; do
+        acl_got $i 1 ""; m=$AG
+        eval w=\"\$AW_$i\"
+        if [ -z "$w" ]; then
+            [ "$m" = "$Z5H" ] || {
+                acl_set 1 $i 0 0 0 0 0; acl_set 0 $i 0 0 0 0 0; acl_set 2 $i 0 0 0 0 0
+                ACLP="$ACLP$i del
+"; }
+        else
+            acl_want_h N${i}s1; mw=$AH
+            acl_got $i 0 ""; pg=$AG; acl_want_h N${i}s0; pw=$AH
+            acl_got $i 2 ""; rg=$AG; acl_want_h N${i}s2; rw=$AH
+            if [ "$m" = "$mw" ] && [ "$pg" = "$pw" ] && [ "$rg" = "$rw" ]; then :
+            else
+                IFS='|'; set -- $w; IFS=$IFS0
+                acl_set 2 $i $3; acl_set 0 $i $1; acl_set 1 $i $2
+                ACLP="$ACLP$i put
+"
+            fi
+        fi
+        i=$((i + 1))
+    done
+    # ARL: if the wanted entries are in place and match the file - nothing; otherwise remove our previous ones
+    # (from the file and, if a PTP MAC is in the table, for the VIDs of the config) and add the wanted ones.
+    want=$(arl_want)
+    ARLDO=1; OLD=""; NEWW=""
+    if [ -n "$want" ] && [ -f $ARLF ] && [ "$(cat $ARLF)" = "$want" ] && arl_present; then ARLDO=0; fi
+    if [ $ARLDO = 1 ]; then
+        [ -f $ARLF ] && OLD=$(cat $ARLF)
+        if grep -q -i -e "$MAC_L2" -e "$MAC_UDP" "$TMP/arl"; then
+            OLD="$OLD
+$(vlans | while read -r vid mem; do d2=$(( (vid << 8) | 0xF ))
+    echo "$vid $MAC_L2 $D0_L2 $(( 0x173E0000 | HI_L2 )) $d2"; echo "$vid $MAC_UDP $D0_UDP $(( 0x173E0000 | HI_UDP )) $d2"; done)"
+        fi
+        u=0
+        while read -r vid mac d0 d1 d2; do
+            [ -n "$vid" ] || continue
+            atu_q $u 3 $d0 $d1 $d2; u=$((u + 1))
+        done <<EOF
+$OLD
+EOF
+        NU=$u
+        if [ -n "$want" ] && [ "$R_IG" = 0 ]; then
+            while read -r vid mac d0 d1 d2; do atu_q $u 2 $d0 $d1 $d2; u=$((u + 1)); done <<EOF
+$want
+EOF
+        fi
+    fi
+    [ $NN -gt 0 ] || [ -s "$TMP/b" ] && brun
+    # --- parse: registers (hex form - one awk for all)
+    while read -r nm lab; do
+        [ -n "$nm" ] || continue
+        eval "wput C$nm \$R_$nm; wput N$nm \$E_$nm; wput G$nm \$R_W$nm"
+    done <<EOF
+$PLAN
+EOF
+    wfmt
+    while read -r nm lab; do
+        [ -n "$nm" ] || continue
+        eval "e=\$E_$nm g=\$R_W$nm ch=\$Y_C$nm eh=\$Y_N$nm gh=\$Y_G$nm"
+        [ $g -eq $e ] || fail "$lab: written $eh, read $gh"
+        echo "  $lab: $ch -> $eh"
+    done <<EOF
+$PLAN
+EOF
+    # --- ACL rules
+    while read -r i what; do
+        [ -n "$i" ] || continue
+        if [ "$what" = del ]; then
+            for s in 1 0 2; do
+                eval "b=\$R_SB${i}s$s"; [ $(( b & 0x80000000 )) -eq 0 ] || fail "ACL_FUNC0 BUSY not cleared"
+                acl_got $i $s V; [ "$AG" = "$Z5H" ] || fail "ACL $i sel $s: written [$Z5H], read [$AG]"
+            done
+            echo "  ACL $i removed"
+        else
+            for s in 2 0 1; do
+                eval "b=\$R_SB${i}s$s"; [ $(( b & 0x80000000 )) -eq 0 ] || fail "ACL_FUNC0 BUSY not cleared"
+                acl_got $i $s V; acl_want_h N${i}s$s
+                [ "$AG" = "$AH" ] || fail "ACL $i sel $s: written [$AH], read [$AG]"
+            done
+            echo "  ACL $i set"
+        fi
+    done <<EOF
+$ACLP
+EOF
+    [ $ARLDO = 1 ] || return 0
+    # --- ARL: remove the previous entries (FULL_VIO: the entry was not there, silently), then add the wanted ones
+    u=0
+    while read -r vid mac d0 d1 d2; do
+        [ -n "$vid" ] || continue
+        atu_chk $u $d0 $d1 $d2 && echo "  ARL VID $vid $mac removed"; u=$((u + 1))
+    done <<EOF
+$OLD
+EOF
+    rm -f $ARLF
+    [ -n "$want" ] || return 0
+    [ "$R_IG" = 0 ] || { echo "  ARL: igmp_snooping = '$R_IG' (expected 0) - PTP entries not added"; return 0; }
+    while read -r vid mac d0 d1 d2; do
+        atu_chk $u $d0 $d1 $d2 || fail "ARL VID $vid $mac: table full (FULL_VIO)"
+        echo "  ARL VID $vid $mac added (ports $(printf '0x%02x' $(( (d1 >> 16) & 0x7F ))))"
+        u=$((u + 1))
+    done <<EOF
+$want
+EOF
+    echo "$want" > $ARLF
+}
+atu_q() {      # $1 operation number, $2 AT_FUNC (2 load, 3 purge), $3 DATA0, $4 DATA1, $5 DATA2 - into the write batch
+    rd UP$1 0x60c
+    wq 0x600 $3; wq 0x604 $4; wq 0x608 $5
+    rd UA$1 0x600; rd UB$1 0x604; rd UC$1 0x608
+    wq 0x60c $(( 0x80000000 | $2 ))
+    rd UF$1 0x60c
+}
+atu_chk() {    # $1 operation number, $2..$4 DATA0..2: 0 - success, 1 - FULL_VIO
+    eval "f0=\$R_UP$1 a=\$R_UA$1 b=\$R_UB$1 c=\$R_UC$1 f=\$R_UF$1"
+    [ $(( f0 & 0x80000000 )) -eq 0 ] || fail "ATU busy"
+    [ $a -eq $(( $2 & 0xFFFFFFFF )) ] && [ $b -eq $(( $3 & 0xFFFFFFFF )) ] && [ $c -eq $(( $4 & 0xFFFFFFFF )) ] \
+        || fail "ATU DATA mismatch before the operation"
+    [ $(( f & 0x80000000 )) -eq 0 ] || fail "ATU BUSY not cleared"
+    [ $(( f & 0x1000 )) -eq 0 ] || return 1
+    return 0
+}
+arl_present() {   # every MAC of $want is in the table
+    while read -r vid mac x; do grep -q -i "$mac" "$TMP/arl" || return 1; done <<EOF
+$want
+EOF
+    return 0
+}
+
+sum_now() { { echo "es5xp-qos $VERSION"; grep -E '^(qos|switch\.vlan)\.' "$CFG"; } | md5sum | cut -d' ' -f1; }
+
+case "$MODE" in
+check)
+    do_check
+    echo "== differences: $DIFF, ASIC writes: $NW, time $(up) s, access: $EXN"
+    [ $DIFF -eq 0 ] || exit 2
+    ;;
+apply|off)
+    S=$(sum_now)
+    if [ "$MODE" = apply ] && [ $FORCE = 0 ] && [ -z "$CUSTOM" ] && [ $TESTCPU = 0 ] && [ -f $SUMF ] && [ "$(cat $SUMF)" = "$S" ]; then
+        echo "== apply: qos.* and switch.vlan.* keys unchanged - skipped (force: -f)"; exit 0
+    fi
+    rm -f $SUMF
+    do_apply
+    [ "$MODE" = apply ] && [ -z "$CUSTOM" ] && [ $TESTCPU = 0 ] && echo "$S" > $SUMF
+    echo "== done: ASIC writes $NW, time $(up) s, access: $EXN"
+    ;;
+esac
