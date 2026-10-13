@@ -1,0 +1,10 @@
+services:
+  firmware-build:
+    image: ubi:amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    user: builder
+    volumes:
+      - ./result:/build/out/release
